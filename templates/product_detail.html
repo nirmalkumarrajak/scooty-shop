@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}{{ product.name }} — ScootyBazaar{% endblock %}
+
+{% block content %}
+<div class="product-detail">
+    <div class="gallery">
+        {% if images %}
+            <div class="gallery-main">
+                <img id="mainImage"
+                     src="{{ url_for('static', filename='images/' + images[0].filename) }}"
+                     alt="{{ product.name }}">
+            </div>
+            <div class="gallery-thumbs">
+                {% for img in images %}
+                    <div class="thumb-item {{ 'active' if loop.first else '' }}"
+                         onclick="swapImage(this, '{{ url_for('static', filename='images/' + img.filename) }}')">
+                        <img src="{{ url_for('static', filename='images/' + img.filename) }}"
+                             alt="View {{ loop.index }}">
+                    </div>
+                {% endfor %}
+            </div>
+        {% elif product.image %}
+            <div class="gallery-main">
+                <img src="{{ url_for('static', filename='images/' + product.image) }}" alt="{{ product.name }}">
+            </div>
+        {% else %}
+            <div class="gallery-main placeholder">
+                {{ '🛵' if product.category == 'scooter' else '🎒' }}
+            </div>
+        {% endif %}
+    </div>
+
+    <div class="detail-info">
+        <h1>{{ product.name }}</h1>
+        <p class="brand">
+            Brand: <strong>{{ product.brand or 'ScootyBazaar' }}</strong>
+            {% if product.vendor_name %}
+                &nbsp;•&nbsp; Sold by: <strong style="color:#7b1fa2;">{{ product.vendor_name }}</strong>
+            {% endif %}
+        </p>
+
+        <div>
+            <span class="rating-badge">{{ '%.1f'|format(product.rating) }} ★</span>
+            <span style="color:#878787; font-size:13px;">
+                ({{ (product.rating * 284)|int }} Ratings &amp; {{ (product.rating * 47)|int }} Reviews)
+            </span>
+        </div>
+
+        <div class="price-block">
+            <span class="current-price">₹{{ '{:,}'.format(product.price|int) }}</span>
+            {% if product.old_price and product.old_price > product.price %}
+                <span class="old-price">₹{{ '{:,}'.format(product.old_price|int) }}</span>
+                <span class="discount">{{ ((product.old_price - product.price) / product.old_price * 100)|int }}% off</span>
+            {% endif %}
+            <p style="font-size:12px; color:#388e3c; margin-top:4px;">inclusive of all taxes</p>
+        </div>
+
+        <div class="stock-info">
+            {% if product.stock > 0 %}
+                <span class="in-stock">✔ In Stock ({{ product.stock }} available)</span>
+            {% else %}
+                <span class="out-stock">✘ Out of Stock</span>
+            {% endif %}
+        </div>
+
+        <h3 style="font-size:16px; margin-bottom:8px;">Description</h3>
+        <p class="description">{{ product.description or 'No description available.' }}</p>
+
+        <div class="buy-row">
+            <a href="{{ url_for('buy_now', pid=product.id) }}" class="btn-buy wa">
+                💬 Buy on WhatsApp
+            </a>
+            <a href="tel:+{{ whatsapp_number }}" class="btn-buy">📞 Call Seller</a>
+        </div>
+
+        <p style="margin-top:16px; font-size:13px; color:#878787;">
+            🚚 Free delivery in 3–5 business days &nbsp;•&nbsp; 🔄 7-day replacement &nbsp;•&nbsp; 💳 COD available
+        </p>
+    </div>
+</div>
+
+<script>
+  function swapImage(thumbEl, newSrc) {
+      document.getElementById('mainImage').src = newSrc;
+      document.querySelectorAll('.thumb-item').forEach(t => t.classList.remove('active'));
+      thumbEl.classList.add('active');
+  }
+</script>
+
+{% if related %}
+<section class="section">
+    <div class="section-header">
+        <h2>Similar Products</h2>
+    </div>
+    <div class="products-grid">
+        {% for p in related %}
+            {% include "_product_card.html" %}
+        {% endfor %}
+    </div>
+</section>
+{% endif %}
+{% endblock %}

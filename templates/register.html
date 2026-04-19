@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Create Account — ScootyBazaar{% endblock %}
+
+{% block content %}
+<div class="form-container">
+    <h2>Create an Account</h2>
+    <p class="subtitle">Join ScootyBazaar and start shopping!</p>
+
+    <form method="post">
+        <div class="form-group">
+            <label>Username *</label>
+            <input type="text" name="username" required autofocus>
+        </div>
+        <div class="form-group">
+            <label>Email *</label>
+            <input type="email" name="email" required>
+        </div>
+        <div class="form-group">
+            <label>Phone Number</label>
+            <input type="tel" name="phone" placeholder="10-digit mobile">
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label>Password *</label>
+                <input type="password" name="password" required minlength="6">
+            </div>
+            <div class="form-group">
+                <label>Confirm Password *</label>
+                <input type="password" name="confirm" required minlength="6">
+            </div>
+        </div>
+        <button type="submit" class="btn-submit">Register</button>
+    </form>
+
+    <div class="form-footer">
+        Already have an account? <a href="{{ url_for('login') }}">Login here</a>
+    </div>
+</div>
+{% endblock %}

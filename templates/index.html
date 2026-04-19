@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}ScootyBazaar — Scooters & Accessories Online{% endblock %}
+
+{% block content %}
+{% if not q and not category %}
+<div class="hero">
+    <h1>Ride into the Future 🛵</h1>
+    <p>Premium scooters & accessories — delivered to your doorstep</p>
+    <div class="wa-badge">💬 Buy instantly via WhatsApp: +91 {{ whatsapp_number[2:] }}</div>
+</div>
+{% endif %}
+
+{% if q %}
+<div class="section">
+    <h2>Results for "{{ q }}"</h2>
+    <p style="color:#878787; font-size:14px; margin-top:4px;">
+        {{ scooters|length + accessories|length }} product(s) found
+    </p>
+</div>
+{% endif %}
+
+{% if scooters and (not category or category == 'scooter') %}
+<section class="section">
+    <div class="section-header">
+        <h2>🛵 Scooters</h2>
+        <span class="count">{{ scooters|length }} models available</span>
+    </div>
+    <div class="products-grid">
+        {% for p in scooters %}
+            {% include "_product_card.html" %}
+        {% endfor %}
+    </div>
+</section>
+{% endif %}
+
+{% if accessories and (not category or category == 'accessory') %}
+<section class="section">
+    <div class="section-header">
+        <h2>🎒 Accessories</h2>
+        <span class="count">{{ accessories|length }} items</span>
+    </div>
+    <div class="products-grid">
+        {% for p in accessories %}
+            {% include "_product_card.html" %}
+        {% endfor %}
+    </div>
+</section>
+{% endif %}
+
+{% if not scooters and not accessories %}
+<section class="section" style="text-align:center; padding:60px 20px;">
+    <h2 style="color:#878787;">No products found 😕</h2>
+    <p style="margin-top:10px;">Try a different search or <a href="{{ url_for('index') }}" style="color:#2874f0;">browse all products</a>.</p>
+</section>
+{% endif %}
+{% endblock %}

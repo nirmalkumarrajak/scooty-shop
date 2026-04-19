@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Vendor Dashboard — ScootyBazaar{% endblock %}
+
+{% block content %}
+<div class="admin-header" style="background:#6a1b9a;">
+    <h1>🏪 {{ vendor.business_name or vendor.username }}</h1>
+    <p>Manage your product listings &nbsp;|&nbsp; 📱 {{ vendor.phone }}</p>
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card" style="border-color:#7b1fa2;">
+        <div class="value" style="color:#7b1fa2;">{{ stats.total }}</div>
+        <div class="label">My Total Products</div>
+    </div>
+    <div class="stat-card" style="border-color:#388e3c;">
+        <div class="value" style="color:#388e3c;">{{ stats.scooters }}</div>
+        <div class="label">Scooters</div>
+    </div>
+    <div class="stat-card" style="border-color:#8e24aa;">
+        <div class="value" style="color:#8e24aa;">{{ stats.accessories }}</div>
+        <div class="label">Accessories</div>
+    </div>
+    <div class="stat-card" style="border-color:#fb641b;">
+        <div class="value" style="color:#fb641b;">{{ stats.in_stock }}</div>
+        <div class="label">In Stock</div>
+    </div>
+</div>
+
+<div class="section">
+    <div class="section-header">
+        <h2>My Products</h2>
+        <a href="{{ url_for('vendor_new_product') }}" class="action-btn add">+ List a New Product</a>
+    </div>
+
+    <div style="overflow-x:auto;">
+    <table class="admin-table">
+        <thead>
+            <tr>
+                <th>#</th>
+                <th>Image</th>
+                <th>Name</th>
+                <th>Category</th>
+                <th>Price</th>
+                <th>Stock</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for p in products %}
+            <tr>
+                <td>{{ p.id }}</td>
+                <td>
+                    {% if p.image %}
+                        <div class="thumb"><img src="{{ url_for('static', filename='images/' + p.image) }}"></div>
+                    {% else %}
+                        <div class="thumb placeholder">{{ '🛵' if p.category == 'scooter' else '🎒' }}</div>
+                    {% endif %}
+                </td>
+                <td>
+                    <strong>{{ p.name }}</strong><br>
+                    <small style="color:#878787;">{{ p.brand or '—' }}</small>
+                </td>
+                <td><span class="category-badge {{ p.category }}">{{ p.category }}</span></td>
+                <td>
+                    <strong>₹{{ '{:,}'.format(p.price|int) }}</strong>
+                    {% if p.old_price %}<br><small style="color:#878787; text-decoration:line-through;">₹{{ '{:,}'.format(p.old_price|int) }}</small>{% endif %}
+                </td>
+                <td>
+                    {% if p.stock > 0 %}
+                        <span style="color:#388e3c;">{{ p.stock }} units</span>
+                    {% else %}
+                        <span style="color:#e53935;">Out</span>
+                    {% endif %}
+                </td>
+                <td>
+                    <a href="{{ url_for('vendor_edit_product', pid=p.id) }}" class="action-btn edit">Edit</a>
+                    <form method="post" action="{{ url_for('vendor_delete_product', pid=p.id) }}"
+                          style="display:inline;"
+                          onsubmit="return confirm('Delete \'{{ p.name }}\'?');">
+                        <button class="action-btn delete" type="submit">Delete</button>
+                    </form>
+                </td>
+            </tr>
+        {% else %}
+            <tr><td colspan="7" style="text-align:center; color:#878787; padding:30px;">
+                You haven't listed any products yet. Click <strong>"+ List a New Product"</strong> to start!
+            </td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    </div>
+</div>
+{% endblock %}

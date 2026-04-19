@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}ScootyBazaar{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<nav class="navbar">
+    <a href="{{ url_for('index') }}" class="logo">
+        ScootyBazaar
+        <span>Explore <em>Plus</em></span>
+    </a>
+
+    <form class="search-bar" action="{{ url_for('index') }}" method="get">
+        <input type="text" name="q" placeholder="Search for scooters, accessories & more"
+               value="{{ request.args.get('q', '') }}">
+        <button type="submit">🔍</button>
+    </form>
+
+    <div class="nav-links">
+        {% if current_user %}
+            <span>Hi, {{ current_user }}</span>
+            {% if is_admin %}
+                <a href="{{ url_for('admin_dashboard') }}" class="admin-btn">Admin Panel</a>
+            {% elif is_vendor %}
+                <a href="{{ url_for('vendor_dashboard') }}" class="vendor-btn">Vendor Panel</a>
+            {% endif %}
+            <a href="{{ url_for('logout') }}">Logout</a>
+        {% else %}
+            <a href="{{ url_for('login') }}" class="login-btn">Login</a>
+            <a href="{{ url_for('vendor_login') }}" class="vendor-btn">Become a Seller</a>
+        {% endif %}
+    </div>
+</nav>
+
+<div class="category-bar">
+    <a href="{{ url_for('index') }}" class="{{ 'active' if not request.args.get('category') else '' }}">All Products</a>
+    <a href="{{ url_for('index', category='scooter') }}"
+       class="{{ 'active' if request.args.get('category') == 'scooter' else '' }}">🛵 Scooters</a>
+    <a href="{{ url_for('index', category='accessory') }}"
+       class="{{ 'active' if request.args.get('category') == 'accessory' else '' }}">🎒 Accessories</a>
+    <a href="#" onclick="alert('Call/WhatsApp: +91 {{ whatsapp_number[2:] }}'); return false;">📞 Contact</a>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+        <div class="flash-container">
+            {% for category, msg in messages %}
+                <div class="flash {{ category }}">{{ msg }}</div>
+            {% endfor %}
+        </div>
+    {% endif %}
+{% endwith %}
+
+{% block content %}{% endblock %}
+
+<footer class="footer">
+    <div class="cols">
+        <div>
+            <h4>About</h4>
+            <ul>
+                <li>Contact Us</li>
+                <li>About ScootyBazaar</li>
+                <li>Careers</li>
+            </ul>
+        </div>
+        <div>
+            <h4>For Sellers</h4>
+            <ul>
+                <li><a href="{{ url_for('vendor_register') }}">Become a Vendor</a></li>
+                <li><a href="{{ url_for('vendor_login') }}">Vendor Login</a></li>
+            </ul>
+        </div>
+        <div>
+            <h4>Policy</h4>
+            <ul>
+                <li>Privacy</li>
+                <li>Terms of Use</li>
+                <li>Security</li>
+            </ul>
+        </div>
+        <div>
+            <h4>Buy via WhatsApp</h4>
+            <ul>
+                <li>📱 +91 {{ whatsapp_number[2:] }}</li>
+                <li>Mon–Sun: 9 AM – 9 PM</li>
+            </ul>
+        </div>
+    </div>
+    <div class="copyright">
+        © {{ current_year }} ScootyBazaar. Built with Flask.
+    </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Edit' if product else 'Add New' }} Product{% endblock %}
+
+{% set is_admin_mode = mode == 'admin' %}
+{% set form_action = url_for('admin_edit_product', pid=product.id) if is_admin_mode and product
+                  else url_for('admin_new_product') if is_admin_mode
+                  else url_for('vendor_edit_product', pid=product.id) if product
+                  else url_for('vendor_new_product') %}
+{% set cancel_url = url_for('admin_dashboard') if is_admin_mode else url_for('vendor_dashboard') %}
+{% set delete_image_url_base = 'admin_delete_image' if is_admin_mode else 'vendor_delete_image' %}
+
+{% block content %}
+<div class="form-container wide">
+    <h2>{{ 'Edit Product' if product else 'Add New Product' }}</h2>
+    <p class="subtitle">
+        {% if product %}Update details for "{{ product.name }}"{% else %}Fill out the details to list a new product{% endif %}
+    </p>
+
+    {% if product and images %}
+    <div class="existing-images">
+        <label style="font-size:13px; font-weight:500; color:#424242; display:block; margin-bottom:10px;">
+            Existing images ({{ images|length }}/5) — click 🗑️ to delete:
+        </label>
+        <div class="image-chip-grid">
+            {% for img in images %}
+            <div class="image-chip">
+                <img src="{{ url_for('static', filename='images/' + img.filename) }}" alt="img">
+                <form method="post"
+                      action="{{ url_for(delete_image_url_base, pid=product.id, img_id=img.id) }}"
+                      onsubmit="return confirm('Delete this image?');">
+                    <button class="chip-del" type="submit" title="Delete">🗑️</button>
+                </form>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    <form method="post" action="{{ form_action }}" enctype="multipart/form-data">
+        <div class="form-group">
+            <label>Product Name *</label>
+            <input type="text" name="name" required value="{{ product.name if product else '' }}">
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label>Category *</label>
+                <select name="category" required>
+                    <option value="scooter" {{ 'selected' if product and product.category == 'scooter' else '' }}>Scooter</option>
+                    <option value="accessory" {{ 'selected' if product and product.category == 'accessory' else '' }}>Accessory</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Brand</label>
+                <input type="text" name="brand" value="{{ product.brand if product else 'ScootyBazaar' }}">
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label>Selling Price (₹) *</label>
+                <input type="number" name="price" step="1" min="1" required
+                       value="{{ product.price|int if product else '' }}">
+            </div>
+            <div class="form-group">
+                <label>MRP / Old Price (₹)</label>
+                <input type="number" name="old_price" step="1" min="0"
+                       value="{{ product.old_price|int if product and product.old_price else '' }}">
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label>Stock Quantity</label>
+                <input type="number" name="stock" min="0" value="{{ product.stock if product else 10 }}">
+            </div>
+            <div class="form-group">
+                <label>Rating (0–5)</label>
+                <input type="number" name="rating" step="0.1" min="0" max="5"
+                       value="{{ product.rating if product else 4.2 }}">
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label>Description</label>
+            <textarea name="description" placeholder="Detailed product description…">{{ product.description if product else '' }}</textarea>
+        </div>
+
+        <div class="form-group">
+            <label>
+                Product Images (select up to 5 — hold Ctrl/Cmd to pick multiple)
+            </label>
+            <input type="file" name="images" accept="image/*" multiple>
+            <p style="font-size:12px; color:#878787; margin-top:6px;">
+                💡 Recommended: 3–5 images per product (front, side, back, close-ups).
+                Supported: png, jpg, jpeg, webp, gif. Max 8 MB each.
+                {% if product %}New uploads are <strong>added</strong> to the existing images above.{% endif %}
+            </p>
+        </div>
+
+        <div style="display:flex; gap:10px;">
+            <button type="submit" class="btn-submit">
+                {{ 'Save Changes' if product else 'Add Product' }}
+            </button>
+            <a href="{{ cancel_url }}"
+               style="padding:12px 24px; background:#e0e0e0; border-radius:3px; color:#424242; font-weight:500; text-transform:uppercase; font-size:15px; text-align:center;">
+                Cancel
+            </a>
+        </div>
+    </form>
+</div>
+{% endblock %}

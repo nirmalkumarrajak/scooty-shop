@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}Admin Dashboard — ScootyBazaar{% endblock %}
+
+{% block content %}
+<div class="admin-header">
+    <h1>Admin Dashboard</h1>
+    <p>Manage ALL products across all vendors, prices &amp; inventory
+        &nbsp;•&nbsp;
+        <a href="{{ url_for('admin_change_password') }}" style="color:#ffd700; text-decoration:underline;">🔑 Change Password</a>
+    </p>
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="value">{{ stats.total_products }}</div>
+        <div class="label">Total Products</div>
+    </div>
+    <div class="stat-card" style="border-color:#388e3c;">
+        <div class="value" style="color:#388e3c;">{{ stats.scooters }}</div>
+        <div class="label">Scooters</div>
+    </div>
+    <div class="stat-card" style="border-color:#8e24aa;">
+        <div class="value" style="color:#8e24aa;">{{ stats.accessories }}</div>
+        <div class="label">Accessories</div>
+    </div>
+    <div class="stat-card" style="border-color:#fb641b;">
+        <div class="value" style="color:#fb641b;">{{ stats.customers }}</div>
+        <div class="label">Customers</div>
+    </div>
+    <div class="stat-card" style="border-color:#7b1fa2;">
+        <div class="value" style="color:#7b1fa2;">{{ stats.vendors }}</div>
+        <div class="label">Vendors</div>
+    </div>
+</div>
+
+<div class="section">
+    <div class="section-header">
+        <h2>All Products</h2>
+        <a href="{{ url_for('admin_new_product') }}" class="action-btn add">+ Add New Product</a>
+    </div>
+
+    <div style="overflow-x:auto;">
+    <table class="admin-table">
+        <thead>
+            <tr>
+                <th>#</th>
+                <th>Image</th>
+                <th>Name</th>
+                <th>Vendor</th>
+                <th>Category</th>
+                <th>Price</th>
+                <th>Stock</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for p in products %}
+            <tr>
+                <td>{{ p.id }}</td>
+                <td>
+                    {% if p.image %}
+                        <div class="thumb"><img src="{{ url_for('static', filename='images/' + p.image) }}"></div>
+                    {% else %}
+                        <div class="thumb placeholder">{{ '🛵' if p.category == 'scooter' else '🎒' }}</div>
+                    {% endif %}
+                </td>
+                <td>
+                    <strong>{{ p.name }}</strong><br>
+                    <small style="color:#878787;">{{ p.brand or '—' }}</small>
+                </td>
+                <td>
+                    <small>
+                        {% if p.vendor_name %}
+                            <strong>{{ p.vendor_name }}</strong><br>
+                            <span style="color:#878787;">@{{ p.vendor_username }}</span>
+                        {% else %}
+                            <span style="color:#878787;">—</span>
+                        {% endif %}
+                    </small>
+                </td>
+                <td><span class="category-badge {{ p.category }}">{{ p.category }}</span></td>
+                <td>
+                    <strong>₹{{ '{:,}'.format(p.price|int) }}</strong>
+                    {% if p.old_price %}<br><small style="color:#878787; text-decoration:line-through;">₹{{ '{:,}'.format(p.old_price|int) }}</small>{% endif %}
+                </td>
+                <td>
+                    {% if p.stock > 0 %}
+                        <span style="color:#388e3c;">{{ p.stock }} units</span>
+                    {% else %}
+                        <span style="color:#e53935;">Out</span>
+                    {% endif %}
+                </td>
+                <td>
+                    <a href="{{ url_for('admin_edit_product', pid=p.id) }}" class="action-btn edit">Edit</a>
+                    <form method="post" action="{{ url_for('admin_delete_product', pid=p.id) }}"
+                          style="display:inline;"
+                          onsubmit="return confirm('Delete \'{{ p.name }}\'?');">
+                        <button class="action-btn delete" type="submit">Delete</button>
+                    </form>
+                </td>
+            </tr>
+        {% else %}
+            <tr><td colspan="8" style="text-align:center; color:#878787; padding:30px;">No products yet.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,30 @@
+<a href="{{ url_for('product_detail', pid=p.id) }}" class="product-card">
+    {% if p.image %}
+        <div class="product-image">
+            <img src="{{ url_for('static', filename='images/' + p.image) }}" alt="{{ p.name }}">
+        </div>
+    {% else %}
+        <div class="product-image placeholder">
+            {{ '🛵' if p.category == 'scooter' else '🎒' }}
+        </div>
+    {% endif %}
+
+    <div class="product-name">{{ p.name }}</div>
+    <div class="product-brand">{{ p.brand or 'ScootyBazaar' }}</div>
+    {% if p.vendor_name %}
+        <div class="product-vendor">Sold by: {{ p.vendor_name }}</div>
+    {% endif %}
+
+    <div class="rating-row">
+        <span class="rating-badge">{{ '%.1f'|format(p.rating) }} ★</span>
+        <span>({{ (p.rating * 284)|int }} reviews)</span>
+    </div>
+
+    <div class="price-row">
+        <span class="current-price">₹{{ '{:,}'.format(p.price|int) }}</span>
+        {% if p.old_price and p.old_price > p.price %}
+            <span class="old-price">₹{{ '{:,}'.format(p.old_price|int) }}</span>
+            <span class="discount">{{ ((p.old_price - p.price) / p.old_price * 100)|int }}% off</span>
+        {% endif %}
+    </div>
+</a>
