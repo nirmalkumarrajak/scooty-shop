@@ -132,8 +132,8 @@ def image_url(filename_or_url: str) -> str:
 
 @app.context_processor
 def inject_helpers():
-    """Make image_url() available in every Jinja template."""
-    return dict(image_url=image_url)
+    """Make image_url() and whatsapp_number available in every Jinja template."""
+    return dict(image_url=image_url, whatsapp_number=WHATSAPP_NUMBER)
 
 
 # ----------------------------- DATABASE -------------------------------------
