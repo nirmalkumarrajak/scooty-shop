@@ -2,18 +2,15 @@
 ScootyBazaar - A Flipkart-style e-commerce website for scooters & accessories.
 Built with Flask + SQLite. Buying redirects to WhatsApp: +91 8789899421
 
-Features:
-- Customer registration & login
-- Admin login (username: admin, password: admin123)
-- Product catalog (scooters + accessories) with categories
-- Admin can add / edit / delete products (name, price, description, image, stock)
-- Buy button opens WhatsApp chat with seller
-- Product search
+Image storage:
+- If AWS_S3_BUCKET env var is set, uploaded images go to S3 (persistent).
+- Otherwise, they fall back to local /static/images/ (works in dev).
+- Old images bundled in the repo keep working in either mode.
 """
 
 import os
 import sqlite3
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from functools import wraps
 from datetime import datetime
 
@@ -30,15 +27,8 @@ DB_PATH = os.path.join(BASE_DIR, "database.db")
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "static", "images")
 ALLOWED_EXT = {"png", "jpg", "jpeg", "webp", "gif"}
 
-# >>> Seller's WhatsApp number (country code 91 for India). Change if needed.
 WHATSAPP_NUMBER = "918789899421"
-
-# >>> Hidden URL for admin access. Change this to something secret in production.
 ADMIN_PORTAL_PATH = "/portal"
-
-# >>> Default admin credentials (only used on FIRST run to seed the DB).
-#     After first login, admin can change this via "Change Password" in the panel.
-#     Once the DB has an admin user, this variable is ignored.
 DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "nirmal123456"
 
@@ -46,6 +36,104 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-this-in-production-please")
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8 MB upload cap
+
+
+# ============================ S3 STORAGE LAYER ==============================
+# Reads these env vars (set them in Render → Environment):
+#   AWS_S3_BUCKET          (required to enable S3, e.g. "scootybazaar-images")
+#   AWS_S3_REGION          (optional, defaults to "ap-south-1" / Mumbai)
+#   AWS_ACCESS_KEY_ID      (required if S3 enabled)
+#   AWS_SECRET_ACCESS_KEY  (required if S3 enabled)
+#   AWS_S3_PUBLIC_URL      (optional CDN/CloudFront base URL, no trailing slash)
+
+S3_BUCKET     = os.environ.get("AWS_S3_BUCKET", "").strip()
+S3_REGION     = os.environ.get("AWS_S3_REGION", "ap-south-1").strip()
+S3_PUBLIC_URL = os.environ.get("AWS_S3_PUBLIC_URL", "").strip().rstrip("/")
+USE_S3        = bool(S3_BUCKET)
+
+s3_client = None
+if USE_S3:
+    try:
+        import boto3
+        s3_client = boto3.client(
+            "s3",
+            region_name=S3_REGION,
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        )
+        print(f"[S3] Enabled - bucket={S3_BUCKET} region={S3_REGION}")
+    except ImportError:
+        print("[S3] boto3 not installed; falling back to local storage.")
+        USE_S3 = False
+    except Exception as e:
+        print(f"[S3] Failed to initialise client: {e}; falling back to local storage.")
+        USE_S3 = False
+else:
+    print("[S3] AWS_S3_BUCKET not set - using local /static/images/ storage.")
+
+
+def _s3_public_url(key: str) -> str:
+    """Build the publicly viewable URL for an S3 object key."""
+    if S3_PUBLIC_URL:
+        return f"{S3_PUBLIC_URL}/{key}"
+    return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
+
+
+def upload_to_s3(file_storage, filename: str):
+    """Upload a Werkzeug FileStorage to S3 under products/<filename>.
+    Returns the public URL on success, or None on failure."""
+    key = f"products/{filename}"
+    extra = {}
+    if file_storage.content_type:
+        extra["ContentType"] = file_storage.content_type
+    extra["CacheControl"] = "public, max-age=31536000, immutable"
+
+    try:
+        file_storage.stream.seek(0)
+        s3_client.upload_fileobj(
+            file_storage.stream, S3_BUCKET, key, ExtraArgs=extra
+        )
+        return _s3_public_url(key)
+    except Exception as e:
+        print(f"[S3] Upload failed for {filename}: {e}")
+        return None
+
+
+def delete_from_s3(url_or_filename: str) -> None:
+    """Delete an object from S3 given its full public URL.
+    Silently no-ops for local filenames or if S3 is off."""
+    if not USE_S3 or not url_or_filename:
+        return
+    if not url_or_filename.startswith(("http://", "https://")):
+        return  # local filename - nothing to do on S3
+
+    try:
+        if S3_PUBLIC_URL and url_or_filename.startswith(S3_PUBLIC_URL):
+            key = url_or_filename[len(S3_PUBLIC_URL):].lstrip("/")
+        else:
+            key = urlparse(url_or_filename).path.lstrip("/")
+        if key:
+            s3_client.delete_object(Bucket=S3_BUCKET, Key=key)
+    except Exception as e:
+        print(f"[S3] Delete failed for {url_or_filename}: {e}")
+
+
+def image_url(filename_or_url: str) -> str:
+    """Template helper. Handles both:
+      - Old/seed images stored as bare filenames in static/images/
+      - New images stored as full S3 URLs
+    """
+    if not filename_or_url:
+        return ""
+    if filename_or_url.startswith(("http://", "https://")):
+        return filename_or_url
+    return url_for("static", filename="images/" + filename_or_url)
+
+
+@app.context_processor
+def inject_helpers():
+    """Make image_url() available in every Jinja template."""
+    return dict(image_url=image_url)
 
 
 # ----------------------------- DATABASE -------------------------------------
@@ -78,7 +166,7 @@ def init_db():
             email         TEXT UNIQUE NOT NULL,
             password      TEXT NOT NULL,
             phone         TEXT,
-            role          TEXT DEFAULT 'customer',   -- 'customer' | 'vendor' | 'admin'
+            role          TEXT DEFAULT 'customer',
             business_name TEXT,
             business_address TEXT,
             approved      INTEGER DEFAULT 1,
@@ -88,15 +176,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS products (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             name        TEXT NOT NULL,
-            category    TEXT NOT NULL,          -- 'scooter' or 'accessory'
+            category    TEXT NOT NULL,
             brand       TEXT,
             price       REAL NOT NULL,
             old_price   REAL,
             description TEXT,
-            image       TEXT,                   -- PRIMARY image filename (used on cards)
+            image       TEXT,
             stock       INTEGER DEFAULT 10,
             rating      REAL DEFAULT 4.2,
-            vendor_id   INTEGER DEFAULT 1,      -- who listed this product (user.id)
+            vendor_id   INTEGER DEFAULT 1,
             created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (vendor_id) REFERENCES users(id)
         );
@@ -111,16 +199,13 @@ def init_db():
     """)
     conn.commit()
 
-    # ---- Seed admin + sample vendor + sample products only on first run ----
     if need_seed or cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
-        # Admin user (id=1). Change password later via "Change Password" in admin panel.
         cur.execute(
             "INSERT OR IGNORE INTO users (username, email, password, phone, role, business_name) "
             "VALUES (?, ?, ?, ?, 'admin', ?)",
             (DEFAULT_ADMIN_USERNAME, "admin@scootybazaar.com",
              generate_password_hash(DEFAULT_ADMIN_PASSWORD), WHATSAPP_NUMBER, "ScootyBazaar HQ")
         )
-        # Sample vendor account (id=2) for the demo data
         cur.execute(
             "INSERT OR IGNORE INTO users (username, email, password, phone, role, business_name, business_address) "
             "VALUES (?, ?, ?, ?, 'vendor', ?, ?)",
@@ -132,7 +217,6 @@ def init_db():
 
     if cur.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
         sample = [
-            # The red scooter from your uploaded image (has 4 gallery images)
             ("Thunder Bolt X1 Electric Scooter", "scooter", "ScootyBazaar",
              94999, 114999,
              "The Thunder Bolt X1 is our flagship electric scooter built for modern Indian cities. "
@@ -153,7 +237,7 @@ def init_db():
             ("EcoRide Zap 2.0 Electric Moped", "scooter", "ScootyBazaar",
              64999, 69999,
              "Compact, lightweight electric moped ideal for students and short city trips. 70 km range, "
-             "removable battery that you can charge indoors. Speeds up to 45 km/h — no license required "
+             "removable battery that you can charge indoors. Speeds up to 45 km/h - no license required "
              "(as per Indian EV norms for low-speed vehicles). Available in 4 colours.",
              None, 30, 4.1),
 
@@ -164,7 +248,6 @@ def init_db():
              "Ideal for long rides and highway commutes.",
              None, 8, 4.5),
 
-            # ---------- Accessories ----------
             ("ISI-Certified Full-Face Helmet (Matte Black)", "accessory", "SafeHead",
              1999, 2499,
              "DOT & ISI certified full-face helmet with anti-fog visor, quick-release strap, "
@@ -175,56 +258,55 @@ def init_db():
             ("Waterproof Scooter Body Cover", "accessory", "ShieldPro",
              799, 1299,
              "Heavy-duty 190T polyester cover with reflective strips. Protects your scooter from sun, rain, "
-             "dust, and bird droppings. Elasticated hem for snug fit. Fits most 100cc–150cc scooters.",
+             "dust, and bird droppings. Elasticated hem for snug fit. Fits most 100cc-150cc scooters.",
              None, 100, 4.2),
 
             ("Mobile Holder with USB Charger", "accessory", "GripX",
              649, 999,
-             "360° rotatable aluminium mobile mount that clamps to the handlebar. Built-in 5V/2A USB-A charging "
-             "port, wired directly to the scooter battery. Fits phones 4.5\"–7.2\".",
+             "360-degree rotatable aluminium mobile mount that clamps to the handlebar. Built-in 5V/2A USB-A "
+             "charging port, wired directly to the scooter battery. Fits phones 4.5\"-7.2\".",
              None, 75, 4.3),
 
             ("Leg Guard with Foot-Rest (Chrome)", "accessory", "ChromeCraft",
              1499, 1899,
              "Heavy-duty chrome-plated steel leg guard. Protects your legs in side-falls and adds extra "
-             "foot-rest space for a passenger. Bolt-on installation, fits most Indian scooter models.",
+             "footrest space for long rides. Universal-fit, comes with all mounting hardware.",
              None, 40, 4.0),
-
-            ("LED Fog Light Kit (Pair)", "accessory", "BrightRide",
-             1299, 1799,
-             "Pair of 30W LED auxiliary fog lights with universal mounting bracket and waterproof wiring harness. "
-             "6500K bright-white beam, aluminium housing for heat dissipation. Includes handlebar on/off switch.",
-             None, 60, 4.2),
         ]
         cur.executemany(
-            """INSERT INTO products
-               (name, category, brand, price, old_price, description, image, stock, rating, vendor_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 2)""",
+            "INSERT INTO products (name, category, brand, price, old_price, description, image, stock, rating) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             sample,
         )
-        conn.commit()
 
-        # Seed product_images table.
-        # The Thunder Bolt X1 (product id=1) gets 4 demo images.
-        # Other products with a single image get that one registered too.
-        image_seed = {
-            1: ["scooter_red.png", "scooter_red_2.png",
-                "scooter_red_3.png", "scooter_red_4.png"],
-        }
-        for pid, filenames in image_seed.items():
-            for idx, fn in enumerate(filenames):
-                cur.execute(
-                    "INSERT INTO product_images (product_id, filename, sort_order) VALUES (?, ?, ?)",
-                    (pid, fn, idx),
-                )
+        gallery = [
+            (1, "scooter_red.png", 0),
+            (1, "scooter_red_side.png", 1),
+            (1, "scooter_red_dash.png", 2),
+            (1, "scooter_red_detail.png", 3),
+        ]
+        cur.executemany(
+            "INSERT INTO product_images (product_id, filename, sort_order) VALUES (?, ?, ?)",
+            gallery,
+        )
+
         conn.commit()
 
     conn.close()
 
 
 # ----------------------------- HELPERS --------------------------------------
-def allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXT
+def allowed_file(name):
+    return "." in name and name.rsplit(".", 1)[1].lower() in ALLOWED_EXT
+
+
+def normalize_phone(phone):
+    if not phone:
+        return ""
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    if len(digits) == 10:
+        digits = "91" + digits
+    return digits
 
 
 def login_required(view):
@@ -241,8 +323,7 @@ def admin_required(view):
     @wraps(view)
     def wrapper(*args, **kwargs):
         if session.get("role") != "admin":
-            flash("Admin access only.", "danger")
-            return redirect(url_for("portal"))
+            abort(404)
         return view(*args, **kwargs)
     return wrapper
 
@@ -251,41 +332,10 @@ def vendor_required(view):
     @wraps(view)
     def wrapper(*args, **kwargs):
         if session.get("role") not in ("vendor", "admin"):
-            flash("Vendor access only.", "danger")
-            return redirect(url_for("vendor_login"))
+            flash("Vendor login required.", "warning")
+            return redirect(url_for("vendor_login", next=request.path))
         return view(*args, **kwargs)
     return wrapper
-
-
-def normalize_phone(raw):
-    """Strip all non-digits. If 10 digits, prepend '91' (India). Return digits-only string."""
-    digits = "".join(ch for ch in (raw or "") if ch.isdigit())
-    if len(digits) == 10:
-        digits = "91" + digits
-    return digits
-
-
-def whatsapp_link(product):
-    """Build a wa.me link pre-filled with the order message."""
-    msg = (f"Hi ScootyBazaar! I want to buy:\n\n"
-           f"*{product['name']}*\n"
-           f"Price: ₹{int(product['price']):,}\n"
-           f"Product ID: #{product['id']}\n\n"
-           f"Please share the next steps.")
-    return f"https://wa.me/{WHATSAPP_NUMBER}?text={quote(msg)}"
-
-
-@app.context_processor
-def inject_globals():
-    """Make these variables available in every template."""
-    return {
-        "current_user": session.get("username"),
-        "role": session.get("role"),
-        "is_admin": session.get("role") == "admin",
-        "is_vendor": session.get("role") == "vendor",
-        "whatsapp_number": WHATSAPP_NUMBER,
-        "current_year": datetime.now().year,
-    }
 
 
 # ----------------------------- PUBLIC ROUTES --------------------------------
@@ -296,73 +346,75 @@ def index():
     category = request.args.get("category", "").strip()
 
     sql = """SELECT p.*, u.business_name AS vendor_name
-             FROM products p LEFT JOIN users u ON p.vendor_id = u.id
-             WHERE 1=1"""
+             FROM products p LEFT JOIN users u ON p.vendor_id = u.id"""
     params = []
+    where = []
     if q:
-        sql += " AND (p.name LIKE ? OR p.description LIKE ? OR p.brand LIKE ?)"
+        where.append("(p.name LIKE ? OR p.description LIKE ? OR p.brand LIKE ?)")
         like = f"%{q}%"
         params += [like, like, like]
     if category in ("scooter", "accessory"):
-        sql += " AND p.category = ?"
+        where.append("p.category = ?")
         params.append(category)
-    sql += " ORDER BY p.created_at DESC"
-
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY p.id DESC"
     products = db.execute(sql, params).fetchall()
+
     scooters = [p for p in products if p["category"] == "scooter"]
     accessories = [p for p in products if p["category"] == "accessory"]
-
-    return render_template("index.html",
-                           scooters=scooters,
-                           accessories=accessories,
-                           q=q, category=category)
+    return render_template(
+        "index.html",
+        products=products, scooters=scooters, accessories=accessories,
+        q=q, category=category,
+    )
 
 
 @app.route("/product/<int:pid>")
 def product_detail(pid):
     db = get_db()
     product = db.execute(
-        """SELECT p.*, u.business_name AS vendor_name, u.id AS v_id
+        """SELECT p.*, u.business_name AS vendor_name, u.phone AS vendor_phone
            FROM products p LEFT JOIN users u ON p.vendor_id = u.id
-           WHERE p.id = ?""", (pid,)
+           WHERE p.id = ?""", (pid,),
     ).fetchone()
     if not product:
         abort(404)
 
-    # Fetch all gallery images for this product
     images = db.execute(
         "SELECT * FROM product_images WHERE product_id = ? ORDER BY sort_order, id",
         (pid,),
     ).fetchall()
 
     related = db.execute(
-        "SELECT * FROM products WHERE category = ? AND id != ? LIMIT 4",
+        "SELECT * FROM products WHERE category = ? AND id != ? ORDER BY RANDOM() LIMIT 4",
         (product["category"], pid),
     ).fetchall()
 
-    return render_template("product_detail.html",
-                           product=product,
-                           images=images,
-                           wa_link=whatsapp_link(product),
-                           related=related)
+    return render_template(
+        "product_detail.html",
+        product=product, images=images, related=related,
+        whatsapp_number=product["vendor_phone"] or WHATSAPP_NUMBER,
+    )
 
 
 @app.route("/buy/<int:pid>")
 def buy_now(pid):
-    """Customers must be logged in to buy — then redirect to WhatsApp."""
-    if "user_id" not in session:
-        flash("Please login to place an order.", "warning")
-        return redirect(url_for("login", next=url_for("product_detail", pid=pid)))
-
     db = get_db()
-    product = db.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+    product = db.execute(
+        """SELECT p.*, u.phone AS vendor_phone
+           FROM products p LEFT JOIN users u ON p.vendor_id = u.id
+           WHERE p.id = ?""", (pid,),
+    ).fetchone()
     if not product:
         abort(404)
-    if product["stock"] <= 0:
-        flash("Sorry, this product is out of stock.", "danger")
-        return redirect(url_for("product_detail", pid=pid))
-
-    return redirect(whatsapp_link(product))
+    msg = (
+        f"Hi! I'm interested in *{product['name']}* "
+        f"(Rs.{int(product['price']):,}) from ScootyBazaar. "
+        f"Please share availability and delivery details."
+    )
+    number = product["vendor_phone"] or WHATSAPP_NUMBER
+    return redirect(f"https://wa.me/{number}?text={quote(msg)}")
 
 
 # ----------------------------- CUSTOMER AUTH --------------------------------
@@ -371,12 +423,12 @@ def register():
     if request.method == "POST":
         username = request.form["username"].strip()
         email    = request.form["email"].strip().lower()
-        phone    = request.form.get("phone", "").strip()
+        phone    = normalize_phone(request.form.get("phone", ""))
         password = request.form["password"]
         confirm  = request.form["confirm"]
 
         if not username or not email or not password:
-            flash("All starred fields are required.", "danger")
+            flash("All fields are required.", "danger")
         elif password != confirm:
             flash("Passwords do not match.", "danger")
         elif len(password) < 6:
@@ -385,11 +437,12 @@ def register():
             db = get_db()
             try:
                 db.execute(
-                    "INSERT INTO users (username, email, password, phone) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO users (username, email, password, phone, role) "
+                    "VALUES (?, ?, ?, ?, 'customer')",
                     (username, email, generate_password_hash(password), phone),
                 )
                 db.commit()
-                flash("Account created! Please login.", "success")
+                flash("Account created. Please login.", "success")
                 return redirect(url_for("login"))
             except sqlite3.IntegrityError:
                 flash("Username or email already exists.", "danger")
@@ -545,7 +598,6 @@ def vendor_edit_product(pid):
     product = db.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
     if not product:
         abort(404)
-    # Vendors can only edit their own products (admins can edit any via /admin route)
     if product["vendor_id"] != session["user_id"] and session.get("role") != "admin":
         abort(403)
 
@@ -597,6 +649,11 @@ def vendor_delete_product(pid):
         abort(404)
     if product["vendor_id"] != session["user_id"] and session.get("role") != "admin":
         abort(403)
+
+    imgs = db.execute("SELECT filename FROM product_images WHERE product_id = ?", (pid,)).fetchall()
+    for img in imgs:
+        delete_from_s3(img["filename"])
+
     db.execute("DELETE FROM products WHERE id = ?", (pid,))
     db.commit()
     flash("Product deleted.", "info")
@@ -616,6 +673,9 @@ def vendor_delete_image(pid, img_id):
                      (img_id, pid)).fetchone()
     if not img:
         abort(404)
+
+    delete_from_s3(img["filename"])
+
     db.execute("DELETE FROM product_images WHERE id = ?", (img_id,))
     if product["image"] == img["filename"]:
         replacement = db.execute(
@@ -629,12 +689,9 @@ def vendor_delete_image(pid, img_id):
     return redirect(url_for("vendor_edit_product", pid=pid))
 
 
-# ----------------------------- HIDDEN ADMIN PORTAL (OTP) --------------------
-# This URL is NOT linked anywhere on the public site.
-# To access: visit ADMIN_PORTAL_PATH and enter the admin's registered email.
+# ----------------------------- HIDDEN ADMIN PORTAL --------------------------
 @app.route(ADMIN_PORTAL_PATH, methods=["GET", "POST"])
 def portal():
-    """Hidden admin login via username + password."""
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
@@ -657,7 +714,6 @@ def portal():
 @app.route("/admin/change-password", methods=["GET", "POST"])
 @admin_required
 def admin_change_password():
-    """Let an authenticated admin change their password."""
     if request.method == "POST":
         current = request.form.get("current", "")
         new     = request.form.get("new", "")
@@ -682,7 +738,7 @@ def admin_change_password():
                 (generate_password_hash(new), session["user_id"]),
             )
             db.commit()
-            flash("✅ Password changed successfully. Please login again with the new password.", "success")
+            flash("Password changed successfully. Please login again with the new password.", "success")
             session.clear()
             return redirect(url_for("portal"))
 
@@ -699,11 +755,10 @@ def admin_dashboard():
            ORDER BY p.id DESC"""
     ).fetchall()
     stats = {
-        "total_products": len(products),
-        "scooters":       sum(1 for p in products if p["category"] == "scooter"),
-        "accessories":    sum(1 for p in products if p["category"] == "accessory"),
-        "customers":      db.execute("SELECT COUNT(*) FROM users WHERE role='customer'").fetchone()[0],
-        "vendors":        db.execute("SELECT COUNT(*) FROM users WHERE role='vendor'").fetchone()[0],
+        "total":       len(products),
+        "scooters":    sum(1 for p in products if p["category"] == "scooter"),
+        "accessories": sum(1 for p in products if p["category"] == "accessory"),
+        "in_stock":    sum(1 for p in products if p["stock"] > 0),
     }
     return render_template("admin_dashboard.html", products=products, stats=stats)
 
@@ -716,7 +771,6 @@ def admin_new_product():
         if data is None:
             return render_template("product_form.html", product=None, images=[], mode="admin")
         uploaded = data.pop("_uploaded_files")
-
         db = get_db()
         cur = db.execute(
             """INSERT INTO products (name, category, brand, price, old_price,
@@ -806,9 +860,10 @@ def admin_delete_image(pid, img_id):
     if not img:
         abort(404)
 
+    delete_from_s3(img["filename"])
+
     db.execute("DELETE FROM product_images WHERE id = ?", (img_id,))
 
-    # If this was the product's primary image, pick a new primary (or clear it)
     product = db.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
     if product and product["image"] == img["filename"]:
         replacement = db.execute(
@@ -829,6 +884,11 @@ def admin_delete_image(pid, img_id):
 @admin_required
 def admin_delete_product(pid):
     db = get_db()
+
+    imgs = db.execute("SELECT filename FROM product_images WHERE product_id = ?", (pid,)).fetchall()
+    for img in imgs:
+        delete_from_s3(img["filename"])
+
     db.execute("DELETE FROM products WHERE id = ?", (pid,))
     db.commit()
     flash("Product deleted.", "info")
@@ -837,7 +897,7 @@ def admin_delete_product(pid):
 
 def _collect_product_form(existing_image=None):
     """Validate & normalise the product form.
-    Returns dict (with special key '_uploaded_files' = list of saved filenames)
+    Returns dict (with special key '_uploaded_files' = list of saved filenames/URLs)
     or None on error."""
     try:
         name        = request.form["name"].strip()
@@ -857,21 +917,30 @@ def _collect_product_form(existing_image=None):
         flash("Name, category and a positive price are required.", "danger")
         return None
 
-    # Handle MULTIPLE image uploads (optional, up to 5)
     uploaded_filenames = []
     files = request.files.getlist("images")
-    for file in files[:5]:  # cap at 5 images per upload
+    for file in files[:5]:
         if file and file.filename:
             if not allowed_file(file.filename):
-                flash(f"'{file.filename}' — image must be png/jpg/jpeg/webp/gif.", "danger")
+                flash(f"'{file.filename}' - image must be png/jpg/jpeg/webp/gif.", "danger")
                 return None
+
             safe = secure_filename(file.filename)
             safe = f"{int(datetime.now().timestamp() * 1000)}_{safe}"
-            file.save(os.path.join(app.config["UPLOAD_FOLDER"], safe))
-            uploaded_filenames.append(safe)
 
-    # `image` field = primary thumbnail filename.
-    # Keep existing one unless the admin uploaded new images AND there was none before.
+            if USE_S3:
+                # Upload to S3 - store the FULL public URL in DB
+                url = upload_to_s3(file, safe)
+                if not url:
+                    flash(f"Failed to upload '{file.filename}' to S3.", "danger")
+                    return None
+                uploaded_filenames.append(url)
+            else:
+                # Local-disk fallback - store bare filename
+                os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+                file.save(os.path.join(app.config["UPLOAD_FOLDER"], safe))
+                uploaded_filenames.append(safe)
+
     primary_image = existing_image
     if uploaded_filenames and not primary_image:
         primary_image = uploaded_filenames[0]
@@ -892,7 +961,6 @@ def not_found(e):
 
 
 # ----------------------------- MAIN -----------------------------------------
-# Initialize DB when the module loads (so gunicorn / production servers also run it)
 init_db()
 
 
@@ -907,7 +975,7 @@ if __name__ == "__main__":
     print(f"  Admin portal (HIDDEN): http://127.0.0.1:5000{ADMIN_PORTAL_PATH}")
     print(f"     Default username: {DEFAULT_ADMIN_USERNAME}")
     print(f"     Default password: {DEFAULT_ADMIN_PASSWORD}")
-    print(f"     ⚠️  Change this password after first login!")
+    print(f"  Image storage: {'S3 (' + S3_BUCKET + ')' if USE_S3 else 'local /static/images/'}")
     print("=" * 60 + "\n")
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, host="0.0.0.0", port=port)

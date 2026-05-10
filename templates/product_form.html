@@ -24,7 +24,7 @@
         <div class="image-chip-grid">
             {% for img in images %}
             <div class="image-chip">
-                <img src="{{ url_for('static', filename='images/' + img.filename) }}" alt="img">
+                <img src="{{ image_url(img.filename) }}" alt="img">
                 <form method="post"
                       action="{{ url_for(delete_image_url_base, pid=product.id, img_id=img.id) }}"
                       onsubmit="return confirm('Delete this image?');">

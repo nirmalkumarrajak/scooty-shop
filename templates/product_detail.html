@@ -7,21 +7,21 @@
         {% if images %}
             <div class="gallery-main">
                 <img id="mainImage"
-                     src="{{ url_for('static', filename='images/' + images[0].filename) }}"
+                     src="{{ image_url(images[0].filename) }}"
                      alt="{{ product.name }}">
             </div>
             <div class="gallery-thumbs">
                 {% for img in images %}
                     <div class="thumb-item {{ 'active' if loop.first else '' }}"
-                         onclick="swapImage(this, '{{ url_for('static', filename='images/' + img.filename) }}')">
-                        <img src="{{ url_for('static', filename='images/' + img.filename) }}"
+                         onclick="swapImage(this, '{{ image_url(img.filename) }}')">
+                        <img src="{{ image_url(img.filename) }}"
                              alt="View {{ loop.index }}">
                     </div>
                 {% endfor %}
             </div>
         {% elif product.image %}
             <div class="gallery-main">
-                <img src="{{ url_for('static', filename='images/' + product.image) }}" alt="{{ product.name }}">
+                <img src="{{ image_url(product.image) }}" alt="{{ product.name }}">
             </div>
         {% else %}
             <div class="gallery-main placeholder">
