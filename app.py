@@ -1,18 +1,20 @@
 """
-ScootyBazaar - A Flipkart-style e-commerce website for scooters & accessories.
-Built with Flask + SQLite. Buying redirects to WhatsApp: +91 8789899421
+ScootyBazaar - Flask + Postgres (Supabase) + AWS S3.
 
-Image storage:
-- If AWS_S3_BUCKET env var is set, uploaded images go to S3 (persistent).
-- Otherwise, they fall back to local /static/images/ (works in dev).
-- Old images bundled in the repo keep working in either mode.
+Storage:
+- Database:  Postgres via DATABASE_URL env var (Supabase Transaction pooler).
+- Images:    AWS S3 if AWS_S3_BUCKET set, else local /static/images/.
+- Old seed images bundled in the repo continue to work in either mode.
 """
 
 import os
-import sqlite3
 from urllib.parse import quote, urlparse
 from functools import wraps
 from datetime import datetime
+
+import psycopg2
+import psycopg2.extras
+from psycopg2 import pool as pg_pool
 
 from flask import (
     Flask, render_template, request, redirect, url_for,
@@ -23,7 +25,6 @@ from werkzeug.utils import secure_filename
 
 # ----------------------------- CONFIG ---------------------------------------
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DB_PATH = os.path.join(BASE_DIR, "database.db")
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "static", "images")
 ALLOWED_EXT = {"png", "jpg", "jpeg", "webp", "gif"}
 
@@ -35,17 +36,200 @@ DEFAULT_ADMIN_PASSWORD = "nirmal123456"
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-this-in-production-please")
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8 MB upload cap
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
+
+
+# ============================ DATABASE (POSTGRES) ===========================
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL env var is not set. "
+        "Get the Transaction pooler URI from Supabase and set it in Render's Environment tab."
+    )
+
+# Connection pool. On Render's free tier the service sleeps after 15 min,
+# so we want a small pool that reconnects gracefully.
+_db_pool = pg_pool.SimpleConnectionPool(
+    minconn=1,
+    maxconn=5,
+    dsn=DATABASE_URL,
+)
+print(f"[DB] Connected to Postgres via pool (max 5 connections).")
+
+
+def get_db():
+    """Borrow a connection from the pool for the duration of one request."""
+    if "db" not in g:
+        g.db = _db_pool.getconn()
+    return g.db
+
+
+def get_cursor():
+    """Convenience: dict-style cursor so rows act like SQLite Row objects."""
+    return get_db().cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+@app.teardown_appcontext
+def close_db(error):
+    db = g.pop("db", None)
+    if db is not None:
+        # Roll back any open transaction on error, otherwise commit
+        try:
+            if error is None:
+                db.commit()
+            else:
+                db.rollback()
+        except Exception:
+            pass
+        _db_pool.putconn(db)
+
+
+def init_db():
+    """Create tables & seed initial data if the DB is empty.
+    Idempotent - safe to call on every startup."""
+    conn = _db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            # Tables ----------------------------------------------------------
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id               SERIAL PRIMARY KEY,
+                    username         TEXT UNIQUE NOT NULL,
+                    email            TEXT UNIQUE NOT NULL,
+                    password         TEXT NOT NULL,
+                    phone            TEXT,
+                    role             TEXT DEFAULT 'customer',
+                    business_name    TEXT,
+                    business_address TEXT,
+                    approved         INTEGER DEFAULT 1,
+                    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS products (
+                    id          SERIAL PRIMARY KEY,
+                    name        TEXT NOT NULL,
+                    category    TEXT NOT NULL,
+                    brand       TEXT,
+                    price       REAL NOT NULL,
+                    old_price   REAL,
+                    description TEXT,
+                    image       TEXT,
+                    stock       INTEGER DEFAULT 10,
+                    rating      REAL DEFAULT 4.2,
+                    vendor_id   INTEGER DEFAULT 1,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (vendor_id) REFERENCES users(id) ON DELETE SET NULL
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS product_images (
+                    id          SERIAL PRIMARY KEY,
+                    product_id  INTEGER NOT NULL,
+                    filename    TEXT NOT NULL,
+                    sort_order  INTEGER DEFAULT 0,
+                    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+                );
+            """)
+
+            # Seed admin + sample vendor on first run ------------------------
+            cur.execute("SELECT COUNT(*) FROM users")
+            user_count = cur.fetchone()[0]
+            if user_count == 0:
+                cur.execute(
+                    "INSERT INTO users (username, email, password, phone, role, business_name) "
+                    "VALUES (%s, %s, %s, %s, 'admin', %s) ON CONFLICT (username) DO NOTHING",
+                    (DEFAULT_ADMIN_USERNAME, "admin@scootybazaar.com",
+                     generate_password_hash(DEFAULT_ADMIN_PASSWORD), WHATSAPP_NUMBER, "ScootyBazaar HQ"),
+                )
+                cur.execute(
+                    "INSERT INTO users (username, email, password, phone, role, business_name, business_address) "
+                    "VALUES (%s, %s, %s, %s, 'vendor', %s, %s) ON CONFLICT (username) DO NOTHING",
+                    ("scootybazaar", "seller@scootybazaar.com",
+                     generate_password_hash("vendor123"), "919999999999",
+                     "ScootyBazaar Authorised Seller", "MG Road, New Delhi - 110001"),
+                )
+
+            # Seed sample products on first run ------------------------------
+            cur.execute("SELECT COUNT(*) FROM products")
+            product_count = cur.fetchone()[0]
+            if product_count == 0:
+                sample = [
+                    ("Thunder Bolt X1 Electric Scooter", "scooter", "ScootyBazaar",
+                     94999, 114999,
+                     "The Thunder Bolt X1 is our flagship electric scooter built for modern Indian cities. "
+                     "Powered by a 3.0 kWh Lithium-ion battery, it delivers a certified range of 120 km on a "
+                     "single charge and a top speed of 85 km/h. Features include a full-LED smart headlamp, "
+                     "digital TFT cluster with Bluetooth turn-by-turn navigation, reverse assist, 3 riding modes "
+                     "(Eco / City / Sport), keyless start, and anti-theft GPS. Ruby-red metallic paint, alloy wheels, "
+                     "and a spacious under-seat storage that fits a full-face helmet. Fast-charges 0-80% in 2.5 hours.",
+                     "scooter_red.png", 15, 4.6),
+                    ("Urban Glide 110 Petrol Scooter", "scooter", "ScootyBazaar",
+                     78500, 82000,
+                     "A reliable 110cc petrol scooter perfect for daily commute. Fuel-injected BS6 engine delivers "
+                     "55 kmpl mileage. Telescopic front suspension, tubeless tyres, USB charging port, "
+                     "and a 22-litre under-seat storage.",
+                     None, 22, 4.3),
+                    ("EcoRide Zap 2.0 Electric Moped", "scooter", "ScootyBazaar",
+                     64999, 69999,
+                     "Compact, lightweight electric moped ideal for students and short city trips. 70 km range, "
+                     "removable battery that you can charge indoors. Speeds up to 45 km/h - no license required "
+                     "(as per Indian EV norms for low-speed vehicles). Available in 4 colours.",
+                     None, 30, 4.1),
+                    ("RoadMaster Pro 125 Maxi Scooter", "scooter", "ScootyBazaar",
+                     125000, 134000,
+                     "Premium 125cc maxi-scooter with a bold muscular design. Disc brakes on both wheels, "
+                     "combi-braking system (CBS), LED DRL, and a large 2-person seat with backrest. "
+                     "Ideal for long rides and highway commutes.",
+                     None, 8, 4.5),
+                    ("ISI-Certified Full-Face Helmet (Matte Black)", "accessory", "SafeHead",
+                     1999, 2499,
+                     "DOT & ISI certified full-face helmet with anti-fog visor, quick-release strap, "
+                     "and internal sun shield. Fits head sizes M / L / XL. Comfortable high-density foam padding, "
+                     "removable washable liner.",
+                     None, 50, 4.4),
+                    ("Waterproof Scooter Body Cover", "accessory", "ShieldPro",
+                     799, 1299,
+                     "Heavy-duty 190T polyester cover with reflective strips. Protects your scooter from sun, rain, "
+                     "dust, and bird droppings. Elasticated hem for snug fit. Fits most 100cc-150cc scooters.",
+                     None, 100, 4.2),
+                    ("Mobile Holder with USB Charger", "accessory", "GripX",
+                     649, 999,
+                     "360-degree rotatable aluminium mobile mount that clamps to the handlebar. Built-in 5V/2A USB-A "
+                     "charging port, wired directly to the scooter battery. Fits phones 4.5\"-7.2\".",
+                     None, 75, 4.3),
+                    ("Leg Guard with Foot-Rest (Chrome)", "accessory", "ChromeCraft",
+                     1499, 1899,
+                     "Heavy-duty chrome-plated steel leg guard. Protects your legs in side-falls and adds extra "
+                     "footrest space for long rides. Universal-fit, comes with all mounting hardware.",
+                     None, 40, 4.0),
+                ]
+                psycopg2.extras.execute_values(
+                    cur,
+                    "INSERT INTO products (name, category, brand, price, old_price, description, image, stock, rating) VALUES %s",
+                    sample,
+                )
+
+                gallery = [
+                    (1, "scooter_red.png", 0),
+                    (1, "scooter_red_side.png", 1),
+                    (1, "scooter_red_dash.png", 2),
+                    (1, "scooter_red_detail.png", 3),
+                ]
+                psycopg2.extras.execute_values(
+                    cur,
+                    "INSERT INTO product_images (product_id, filename, sort_order) VALUES %s",
+                    gallery,
+                )
+
+            conn.commit()
+            print("[DB] Schema ready (created tables if missing, seeded if empty).")
+    finally:
+        _db_pool.putconn(conn)
 
 
 # ============================ S3 STORAGE LAYER ==============================
-# Reads these env vars (set them in Render → Environment):
-#   AWS_S3_BUCKET          (required to enable S3, e.g. "scootybazaar-images")
-#   AWS_S3_REGION          (optional, defaults to "ap-south-1" / Mumbai)
-#   AWS_ACCESS_KEY_ID      (required if S3 enabled)
-#   AWS_SECRET_ACCESS_KEY  (required if S3 enabled)
-#   AWS_S3_PUBLIC_URL      (optional CDN/CloudFront base URL, no trailing slash)
-
 S3_BUCKET     = os.environ.get("AWS_S3_BUCKET", "").strip()
 S3_REGION     = os.environ.get("AWS_S3_REGION", "ap-south-1").strip()
 S3_PUBLIC_URL = os.environ.get("AWS_S3_PUBLIC_URL", "").strip().rstrip("/")
@@ -73,26 +257,20 @@ else:
 
 
 def _s3_public_url(key: str) -> str:
-    """Build the publicly viewable URL for an S3 object key."""
     if S3_PUBLIC_URL:
         return f"{S3_PUBLIC_URL}/{key}"
     return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
 
 
 def upload_to_s3(file_storage, filename: str):
-    """Upload a Werkzeug FileStorage to S3 under products/<filename>.
-    Returns the public URL on success, or None on failure."""
     key = f"products/{filename}"
     extra = {}
     if file_storage.content_type:
         extra["ContentType"] = file_storage.content_type
     extra["CacheControl"] = "public, max-age=31536000, immutable"
-
     try:
         file_storage.stream.seek(0)
-        s3_client.upload_fileobj(
-            file_storage.stream, S3_BUCKET, key, ExtraArgs=extra
-        )
+        s3_client.upload_fileobj(file_storage.stream, S3_BUCKET, key, ExtraArgs=extra)
         return _s3_public_url(key)
     except Exception as e:
         print(f"[S3] Upload failed for {filename}: {e}")
@@ -100,13 +278,10 @@ def upload_to_s3(file_storage, filename: str):
 
 
 def delete_from_s3(url_or_filename: str) -> None:
-    """Delete an object from S3 given its full public URL.
-    Silently no-ops for local filenames or if S3 is off."""
     if not USE_S3 or not url_or_filename:
         return
     if not url_or_filename.startswith(("http://", "https://")):
-        return  # local filename - nothing to do on S3
-
+        return
     try:
         if S3_PUBLIC_URL and url_or_filename.startswith(S3_PUBLIC_URL):
             key = url_or_filename[len(S3_PUBLIC_URL):].lstrip("/")
@@ -119,10 +294,6 @@ def delete_from_s3(url_or_filename: str) -> None:
 
 
 def image_url(filename_or_url: str) -> str:
-    """Template helper. Handles both:
-      - Old/seed images stored as bare filenames in static/images/
-      - New images stored as full S3 URLs
-    """
     if not filename_or_url:
         return ""
     if filename_or_url.startswith(("http://", "https://")):
@@ -132,167 +303,7 @@ def image_url(filename_or_url: str) -> str:
 
 @app.context_processor
 def inject_helpers():
-    """Make image_url() and whatsapp_number available in every Jinja template."""
     return dict(image_url=image_url, whatsapp_number=WHATSAPP_NUMBER)
-
-
-# ----------------------------- DATABASE -------------------------------------
-def get_db():
-    if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys = ON")
-    return g.db
-
-
-@app.teardown_appcontext
-def close_db(error):
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
-
-
-def init_db():
-    """Create tables & seed initial data if the DB is empty."""
-    need_seed = not os.path.exists(DB_PATH)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-
-    cur.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            username      TEXT UNIQUE NOT NULL,
-            email         TEXT UNIQUE NOT NULL,
-            password      TEXT NOT NULL,
-            phone         TEXT,
-            role          TEXT DEFAULT 'customer',
-            business_name TEXT,
-            business_address TEXT,
-            approved      INTEGER DEFAULT 1,
-            created_at    TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS products (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL,
-            category    TEXT NOT NULL,
-            brand       TEXT,
-            price       REAL NOT NULL,
-            old_price   REAL,
-            description TEXT,
-            image       TEXT,
-            stock       INTEGER DEFAULT 10,
-            rating      REAL DEFAULT 4.2,
-            vendor_id   INTEGER DEFAULT 1,
-            created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (vendor_id) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS product_images (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id  INTEGER NOT NULL,
-            filename    TEXT NOT NULL,
-            sort_order  INTEGER DEFAULT 0,
-            FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
-        );
-    """)
-    conn.commit()
-
-    if need_seed or cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
-        cur.execute(
-            "INSERT OR IGNORE INTO users (username, email, password, phone, role, business_name) "
-            "VALUES (?, ?, ?, ?, 'admin', ?)",
-            (DEFAULT_ADMIN_USERNAME, "admin@scootybazaar.com",
-             generate_password_hash(DEFAULT_ADMIN_PASSWORD), WHATSAPP_NUMBER, "ScootyBazaar HQ")
-        )
-        cur.execute(
-            "INSERT OR IGNORE INTO users (username, email, password, phone, role, business_name, business_address) "
-            "VALUES (?, ?, ?, ?, 'vendor', ?, ?)",
-            ("scootybazaar", "seller@scootybazaar.com",
-             generate_password_hash("vendor123"), "919999999999",
-             "ScootyBazaar Authorised Seller", "MG Road, New Delhi - 110001")
-        )
-        conn.commit()
-
-    if cur.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
-        sample = [
-            ("Thunder Bolt X1 Electric Scooter", "scooter", "ScootyBazaar",
-             94999, 114999,
-             "The Thunder Bolt X1 is our flagship electric scooter built for modern Indian cities. "
-             "Powered by a 3.0 kWh Lithium-ion battery, it delivers a certified range of 120 km on a "
-             "single charge and a top speed of 85 km/h. Features include a full-LED smart headlamp, "
-             "digital TFT cluster with Bluetooth turn-by-turn navigation, reverse assist, 3 riding modes "
-             "(Eco / City / Sport), keyless start, and anti-theft GPS. Ruby-red metallic paint, alloy wheels, "
-             "and a spacious under-seat storage that fits a full-face helmet. Fast-charges 0-80% in 2.5 hours.",
-             "scooter_red.png", 15, 4.6),
-
-            ("Urban Glide 110 Petrol Scooter", "scooter", "ScootyBazaar",
-             78500, 82000,
-             "A reliable 110cc petrol scooter perfect for daily commute. Fuel-injected BS6 engine delivers "
-             "55 kmpl mileage. Telescopic front suspension, tubeless tyres, USB charging port, "
-             "and a 22-litre under-seat storage.",
-             None, 22, 4.3),
-
-            ("EcoRide Zap 2.0 Electric Moped", "scooter", "ScootyBazaar",
-             64999, 69999,
-             "Compact, lightweight electric moped ideal for students and short city trips. 70 km range, "
-             "removable battery that you can charge indoors. Speeds up to 45 km/h - no license required "
-             "(as per Indian EV norms for low-speed vehicles). Available in 4 colours.",
-             None, 30, 4.1),
-
-            ("RoadMaster Pro 125 Maxi Scooter", "scooter", "ScootyBazaar",
-             125000, 134000,
-             "Premium 125cc maxi-scooter with a bold muscular design. Disc brakes on both wheels, "
-             "combi-braking system (CBS), LED DRL, and a large 2-person seat with backrest. "
-             "Ideal for long rides and highway commutes.",
-             None, 8, 4.5),
-
-            ("ISI-Certified Full-Face Helmet (Matte Black)", "accessory", "SafeHead",
-             1999, 2499,
-             "DOT & ISI certified full-face helmet with anti-fog visor, quick-release strap, "
-             "and internal sun shield. Fits head sizes M / L / XL. Comfortable high-density foam padding, "
-             "removable washable liner.",
-             None, 50, 4.4),
-
-            ("Waterproof Scooter Body Cover", "accessory", "ShieldPro",
-             799, 1299,
-             "Heavy-duty 190T polyester cover with reflective strips. Protects your scooter from sun, rain, "
-             "dust, and bird droppings. Elasticated hem for snug fit. Fits most 100cc-150cc scooters.",
-             None, 100, 4.2),
-
-            ("Mobile Holder with USB Charger", "accessory", "GripX",
-             649, 999,
-             "360-degree rotatable aluminium mobile mount that clamps to the handlebar. Built-in 5V/2A USB-A "
-             "charging port, wired directly to the scooter battery. Fits phones 4.5\"-7.2\".",
-             None, 75, 4.3),
-
-            ("Leg Guard with Foot-Rest (Chrome)", "accessory", "ChromeCraft",
-             1499, 1899,
-             "Heavy-duty chrome-plated steel leg guard. Protects your legs in side-falls and adds extra "
-             "footrest space for long rides. Universal-fit, comes with all mounting hardware.",
-             None, 40, 4.0),
-        ]
-        cur.executemany(
-            "INSERT INTO products (name, category, brand, price, old_price, description, image, stock, rating) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            sample,
-        )
-
-        gallery = [
-            (1, "scooter_red.png", 0),
-            (1, "scooter_red_side.png", 1),
-            (1, "scooter_red_dash.png", 2),
-            (1, "scooter_red_detail.png", 3),
-        ]
-        cur.executemany(
-            "INSERT INTO product_images (product_id, filename, sort_order) VALUES (?, ?, ?)",
-            gallery,
-        )
-
-        conn.commit()
-
-    conn.close()
 
 
 # ----------------------------- HELPERS --------------------------------------
@@ -341,7 +352,6 @@ def vendor_required(view):
 # ----------------------------- PUBLIC ROUTES --------------------------------
 @app.route("/")
 def index():
-    db = get_db()
     q = request.args.get("q", "").strip()
     category = request.args.get("category", "").strip()
 
@@ -350,46 +360,50 @@ def index():
     params = []
     where = []
     if q:
-        where.append("(p.name LIKE ? OR p.description LIKE ? OR p.brand LIKE ?)")
+        where.append("(p.name ILIKE %s OR p.description ILIKE %s OR p.brand ILIKE %s)")
         like = f"%{q}%"
         params += [like, like, like]
     if category in ("scooter", "accessory"):
-        where.append("p.category = ?")
+        where.append("p.category = %s")
         params.append(category)
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY p.id DESC"
-    products = db.execute(sql, params).fetchall()
+
+    with get_cursor() as cur:
+        cur.execute(sql, params)
+        products = cur.fetchall()
 
     scooters = [p for p in products if p["category"] == "scooter"]
     accessories = [p for p in products if p["category"] == "accessory"]
-    return render_template(
-        "index.html",
-        products=products, scooters=scooters, accessories=accessories,
-        q=q, category=category,
-    )
+    return render_template("index.html",
+                           products=products, scooters=scooters,
+                           accessories=accessories, q=q, category=category)
 
 
 @app.route("/product/<int:pid>")
 def product_detail(pid):
-    db = get_db()
-    product = db.execute(
-        """SELECT p.*, u.business_name AS vendor_name, u.phone AS vendor_phone
-           FROM products p LEFT JOIN users u ON p.vendor_id = u.id
-           WHERE p.id = ?""", (pid,),
-    ).fetchone()
-    if not product:
-        abort(404)
+    with get_cursor() as cur:
+        cur.execute(
+            """SELECT p.*, u.business_name AS vendor_name, u.phone AS vendor_phone
+               FROM products p LEFT JOIN users u ON p.vendor_id = u.id
+               WHERE p.id = %s""", (pid,),
+        )
+        product = cur.fetchone()
+        if not product:
+            abort(404)
 
-    images = db.execute(
-        "SELECT * FROM product_images WHERE product_id = ? ORDER BY sort_order, id",
-        (pid,),
-    ).fetchall()
+        cur.execute(
+            "SELECT * FROM product_images WHERE product_id = %s ORDER BY sort_order, id",
+            (pid,),
+        )
+        images = cur.fetchall()
 
-    related = db.execute(
-        "SELECT * FROM products WHERE category = ? AND id != ? ORDER BY RANDOM() LIMIT 4",
-        (product["category"], pid),
-    ).fetchall()
+        cur.execute(
+            "SELECT * FROM products WHERE category = %s AND id != %s ORDER BY RANDOM() LIMIT 4",
+            (product["category"], pid),
+        )
+        related = cur.fetchall()
 
     return render_template(
         "product_detail.html",
@@ -400,12 +414,13 @@ def product_detail(pid):
 
 @app.route("/buy/<int:pid>")
 def buy_now(pid):
-    db = get_db()
-    product = db.execute(
-        """SELECT p.*, u.phone AS vendor_phone
-           FROM products p LEFT JOIN users u ON p.vendor_id = u.id
-           WHERE p.id = ?""", (pid,),
-    ).fetchone()
+    with get_cursor() as cur:
+        cur.execute(
+            """SELECT p.*, u.phone AS vendor_phone
+               FROM products p LEFT JOIN users u ON p.vendor_id = u.id
+               WHERE p.id = %s""", (pid,),
+        )
+        product = cur.fetchone()
     if not product:
         abort(404)
     msg = (
@@ -434,17 +449,17 @@ def register():
         elif len(password) < 6:
             flash("Password must be at least 6 characters.", "danger")
         else:
-            db = get_db()
             try:
-                db.execute(
-                    "INSERT INTO users (username, email, password, phone, role) "
-                    "VALUES (?, ?, ?, ?, 'customer')",
-                    (username, email, generate_password_hash(password), phone),
-                )
-                db.commit()
+                with get_cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO users (username, email, password, phone, role) "
+                        "VALUES (%s, %s, %s, %s, 'customer')",
+                        (username, email, generate_password_hash(password), phone),
+                    )
                 flash("Account created. Please login.", "success")
                 return redirect(url_for("login"))
-            except sqlite3.IntegrityError:
+            except psycopg2.IntegrityError:
+                get_db().rollback()
                 flash("Username or email already exists.", "danger")
 
     return render_template("register.html")
@@ -455,11 +470,12 @@ def login():
     if request.method == "POST":
         identifier = request.form["identifier"].strip()
         password   = request.form["password"]
-        db = get_db()
-        user = db.execute(
-            "SELECT * FROM users WHERE (username = ? OR email = ?) AND role = 'customer'",
-            (identifier, identifier.lower()),
-        ).fetchone()
+        with get_cursor() as cur:
+            cur.execute(
+                "SELECT * FROM users WHERE (username = %s OR email = %s) AND role = 'customer'",
+                (identifier, identifier.lower()),
+            )
+            user = cur.fetchone()
 
         if user and check_password_hash(user["password"], password):
             session.clear()
@@ -501,19 +517,19 @@ def vendor_register():
         elif len(phone) != 12:
             flash("Please enter a valid 10-digit mobile number.", "danger")
         else:
-            db = get_db()
             try:
-                db.execute(
-                    """INSERT INTO users
-                       (username, email, password, phone, role, business_name, business_address)
-                       VALUES (?, ?, ?, ?, 'vendor', ?, ?)""",
-                    (username, email, generate_password_hash(password),
-                     phone, business_name, business_address),
-                )
-                db.commit()
+                with get_cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO users
+                           (username, email, password, phone, role, business_name, business_address)
+                           VALUES (%s, %s, %s, %s, 'vendor', %s, %s)""",
+                        (username, email, generate_password_hash(password),
+                         phone, business_name, business_address),
+                    )
                 flash("Vendor account created! Please login to start listing products.", "success")
                 return redirect(url_for("vendor_login"))
-            except sqlite3.IntegrityError:
+            except psycopg2.IntegrityError:
+                get_db().rollback()
                 flash("Username or email already exists.", "danger")
 
     return render_template("vendor_register.html")
@@ -524,11 +540,12 @@ def vendor_login():
     if request.method == "POST":
         identifier = request.form["identifier"].strip()
         password   = request.form["password"]
-        db = get_db()
-        user = db.execute(
-            "SELECT * FROM users WHERE (username = ? OR email = ?) AND role = 'vendor'",
-            (identifier, identifier.lower()),
-        ).fetchone()
+        with get_cursor() as cur:
+            cur.execute(
+                "SELECT * FROM users WHERE (username = %s OR email = %s) AND role = 'vendor'",
+                (identifier, identifier.lower()),
+            )
+            user = cur.fetchone()
 
         if user and check_password_hash(user["password"], password):
             session.clear()
@@ -545,12 +562,14 @@ def vendor_login():
 @app.route("/vendor")
 @vendor_required
 def vendor_dashboard():
-    db = get_db()
     uid = session["user_id"]
-    user = db.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
-    products = db.execute(
-        "SELECT * FROM products WHERE vendor_id = ? ORDER BY id DESC", (uid,)
-    ).fetchall()
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE id = %s", (uid,))
+        user = cur.fetchone()
+        cur.execute(
+            "SELECT * FROM products WHERE vendor_id = %s ORDER BY id DESC", (uid,)
+        )
+        products = cur.fetchall()
     stats = {
         "total":       len(products),
         "scooters":    sum(1 for p in products if p["category"] == "scooter"),
@@ -570,21 +589,23 @@ def vendor_new_product():
             return render_template("product_form.html",
                                    product=None, images=[], mode="vendor")
         uploaded = data.pop("_uploaded_files")
-        db = get_db()
-        cur = db.execute(
-            """INSERT INTO products (name, category, brand, price, old_price,
-                                     description, image, stock, rating, vendor_id)
-               VALUES (:name, :category, :brand, :price, :old_price,
-                       :description, :image, :stock, :rating, :vendor_id)""",
-            {**data, "vendor_id": session["user_id"]},
-        )
-        new_pid = cur.lastrowid
-        for idx, fn in enumerate(uploaded):
-            db.execute("INSERT INTO product_images (product_id, filename, sort_order) VALUES (?, ?, ?)",
-                       (new_pid, fn, idx))
-        if uploaded and not data.get("image"):
-            db.execute("UPDATE products SET image=? WHERE id=?", (uploaded[0], new_pid))
-        db.commit()
+        with get_cursor() as cur:
+            cur.execute(
+                """INSERT INTO products (name, category, brand, price, old_price,
+                                         description, image, stock, rating, vendor_id)
+                   VALUES (%(name)s, %(category)s, %(brand)s, %(price)s, %(old_price)s,
+                           %(description)s, %(image)s, %(stock)s, %(rating)s, %(vendor_id)s)
+                   RETURNING id""",
+                {**data, "vendor_id": session["user_id"]},
+            )
+            new_pid = cur.fetchone()["id"]
+            for idx, fn in enumerate(uploaded):
+                cur.execute(
+                    "INSERT INTO product_images (product_id, filename, sort_order) VALUES (%s, %s, %s)",
+                    (new_pid, fn, idx),
+                )
+            if uploaded and not data.get("image"):
+                cur.execute("UPDATE products SET image=%s WHERE id=%s", (uploaded[0], new_pid))
         flash(f"Product added with {len(uploaded)} image(s).", "success")
         return redirect(url_for("vendor_dashboard"))
 
@@ -594,17 +615,20 @@ def vendor_new_product():
 @app.route("/vendor/product/<int:pid>/edit", methods=["GET", "POST"])
 @vendor_required
 def vendor_edit_product(pid):
-    db = get_db()
-    product = db.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM products WHERE id = %s", (pid,))
+        product = cur.fetchone()
     if not product:
         abort(404)
     if product["vendor_id"] != session["user_id"] and session.get("role") != "admin":
         abort(403)
 
-    images = db.execute(
-        "SELECT * FROM product_images WHERE product_id = ? ORDER BY sort_order, id",
-        (pid,),
-    ).fetchall()
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT * FROM product_images WHERE product_id = %s ORDER BY sort_order, id",
+            (pid,),
+        )
+        images = cur.fetchall()
 
     if request.method == "POST":
         data = _collect_product_form(existing_image=product["image"])
@@ -613,27 +637,30 @@ def vendor_edit_product(pid):
                                    product=product, images=images, mode="vendor")
         uploaded = data.pop("_uploaded_files")
         data["id"] = pid
-        db.execute(
-            """UPDATE products SET
-                 name=:name, category=:category, brand=:brand,
-                 price=:price, old_price=:old_price,
-                 description=:description, image=:image,
-                 stock=:stock, rating=:rating
-               WHERE id=:id""",
-            data,
-        )
-        if uploaded:
-            row = db.execute(
-                "SELECT COALESCE(MAX(sort_order), -1) FROM product_images WHERE product_id=?", (pid,)
-            ).fetchone()
-            next_order = row[0] + 1
-            for fn in uploaded:
-                db.execute("INSERT INTO product_images (product_id, filename, sort_order) VALUES (?, ?, ?)",
-                           (pid, fn, next_order))
-                next_order += 1
-            if not product["image"]:
-                db.execute("UPDATE products SET image=? WHERE id=?", (uploaded[0], pid))
-        db.commit()
+        with get_cursor() as cur:
+            cur.execute(
+                """UPDATE products SET
+                     name=%(name)s, category=%(category)s, brand=%(brand)s,
+                     price=%(price)s, old_price=%(old_price)s,
+                     description=%(description)s, image=%(image)s,
+                     stock=%(stock)s, rating=%(rating)s
+                   WHERE id=%(id)s""",
+                data,
+            )
+            if uploaded:
+                cur.execute(
+                    "SELECT COALESCE(MAX(sort_order), -1) AS m FROM product_images WHERE product_id=%s",
+                    (pid,),
+                )
+                next_order = cur.fetchone()["m"] + 1
+                for fn in uploaded:
+                    cur.execute(
+                        "INSERT INTO product_images (product_id, filename, sort_order) VALUES (%s, %s, %s)",
+                        (pid, fn, next_order),
+                    )
+                    next_order += 1
+                if not product["image"]:
+                    cur.execute("UPDATE products SET image=%s WHERE id=%s", (uploaded[0], pid))
         flash(f"Product updated. {len(uploaded)} new image(s) added." if uploaded else "Product updated.", "success")
         return redirect(url_for("vendor_edit_product", pid=pid))
 
@@ -643,19 +670,20 @@ def vendor_edit_product(pid):
 @app.route("/vendor/product/<int:pid>/delete", methods=["POST"])
 @vendor_required
 def vendor_delete_product(pid):
-    db = get_db()
-    product = db.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
-    if not product:
-        abort(404)
-    if product["vendor_id"] != session["user_id"] and session.get("role") != "admin":
-        abort(403)
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM products WHERE id = %s", (pid,))
+        product = cur.fetchone()
+        if not product:
+            abort(404)
+        if product["vendor_id"] != session["user_id"] and session.get("role") != "admin":
+            abort(403)
 
-    imgs = db.execute("SELECT filename FROM product_images WHERE product_id = ?", (pid,)).fetchall()
-    for img in imgs:
-        delete_from_s3(img["filename"])
+        cur.execute("SELECT filename FROM product_images WHERE product_id = %s", (pid,))
+        imgs = cur.fetchall()
+        for img in imgs:
+            delete_from_s3(img["filename"])
 
-    db.execute("DELETE FROM products WHERE id = ?", (pid,))
-    db.commit()
+        cur.execute("DELETE FROM products WHERE id = %s", (pid,))
     flash("Product deleted.", "info")
     return redirect(url_for("vendor_dashboard"))
 
@@ -663,28 +691,34 @@ def vendor_delete_product(pid):
 @app.route("/vendor/product/<int:pid>/image/<int:img_id>/delete", methods=["POST"])
 @vendor_required
 def vendor_delete_image(pid, img_id):
-    db = get_db()
-    product = db.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
-    if not product:
-        abort(404)
-    if product["vendor_id"] != session["user_id"] and session.get("role") != "admin":
-        abort(403)
-    img = db.execute("SELECT * FROM product_images WHERE id = ? AND product_id = ?",
-                     (img_id, pid)).fetchone()
-    if not img:
-        abort(404)
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM products WHERE id = %s", (pid,))
+        product = cur.fetchone()
+        if not product:
+            abort(404)
+        if product["vendor_id"] != session["user_id"] and session.get("role") != "admin":
+            abort(403)
+        cur.execute(
+            "SELECT * FROM product_images WHERE id = %s AND product_id = %s",
+            (img_id, pid),
+        )
+        img = cur.fetchone()
+        if not img:
+            abort(404)
 
-    delete_from_s3(img["filename"])
+        delete_from_s3(img["filename"])
+        cur.execute("DELETE FROM product_images WHERE id = %s", (img_id,))
 
-    db.execute("DELETE FROM product_images WHERE id = ?", (img_id,))
-    if product["image"] == img["filename"]:
-        replacement = db.execute(
-            "SELECT filename FROM product_images WHERE product_id = ? ORDER BY sort_order, id LIMIT 1",
-            (pid,),
-        ).fetchone()
-        db.execute("UPDATE products SET image = ? WHERE id = ?",
-                   (replacement["filename"] if replacement else None, pid))
-    db.commit()
+        if product["image"] == img["filename"]:
+            cur.execute(
+                "SELECT filename FROM product_images WHERE product_id = %s ORDER BY sort_order, id LIMIT 1",
+                (pid,),
+            )
+            replacement = cur.fetchone()
+            cur.execute(
+                "UPDATE products SET image = %s WHERE id = %s",
+                (replacement["filename"] if replacement else None, pid),
+            )
     flash("Image deleted.", "info")
     return redirect(url_for("vendor_edit_product", pid=pid))
 
@@ -695,10 +729,11 @@ def portal():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        db = get_db()
-        user = db.execute(
-            "SELECT * FROM users WHERE username = ? AND role = 'admin'", (username,)
-        ).fetchone()
+        with get_cursor() as cur:
+            cur.execute(
+                "SELECT * FROM users WHERE username = %s AND role = 'admin'", (username,)
+            )
+            user = cur.fetchone()
         if user and check_password_hash(user["password"], password):
             session.clear()
             session["user_id"]  = user["id"]
@@ -719,10 +754,9 @@ def admin_change_password():
         new     = request.form.get("new", "")
         confirm = request.form.get("confirm", "")
 
-        db = get_db()
-        user = db.execute(
-            "SELECT * FROM users WHERE id = ?", (session["user_id"],)
-        ).fetchone()
+        with get_cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE id = %s", (session["user_id"],))
+            user = cur.fetchone()
 
         if not user or not check_password_hash(user["password"], current):
             flash("Current password is incorrect.", "danger")
@@ -733,11 +767,11 @@ def admin_change_password():
         elif new == current:
             flash("New password must be different from the current one.", "warning")
         else:
-            db.execute(
-                "UPDATE users SET password = ? WHERE id = ?",
-                (generate_password_hash(new), session["user_id"]),
-            )
-            db.commit()
+            with get_cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET password = %s WHERE id = %s",
+                    (generate_password_hash(new), session["user_id"]),
+                )
             flash("Password changed successfully. Please login again with the new password.", "success")
             session.clear()
             return redirect(url_for("portal"))
@@ -748,12 +782,13 @@ def admin_change_password():
 @app.route("/admin")
 @admin_required
 def admin_dashboard():
-    db = get_db()
-    products = db.execute(
-        """SELECT p.*, u.business_name AS vendor_name, u.username AS vendor_username
-           FROM products p LEFT JOIN users u ON p.vendor_id = u.id
-           ORDER BY p.id DESC"""
-    ).fetchall()
+    with get_cursor() as cur:
+        cur.execute(
+            """SELECT p.*, u.business_name AS vendor_name, u.username AS vendor_username
+               FROM products p LEFT JOIN users u ON p.vendor_id = u.id
+               ORDER BY p.id DESC"""
+        )
+        products = cur.fetchall()
     stats = {
         "total":       len(products),
         "scooters":    sum(1 for p in products if p["category"] == "scooter"),
@@ -771,25 +806,23 @@ def admin_new_product():
         if data is None:
             return render_template("product_form.html", product=None, images=[], mode="admin")
         uploaded = data.pop("_uploaded_files")
-        db = get_db()
-        cur = db.execute(
-            """INSERT INTO products (name, category, brand, price, old_price,
-                                     description, image, stock, rating, vendor_id)
-               VALUES (:name, :category, :brand, :price, :old_price,
-                       :description, :image, :stock, :rating, :vendor_id)""",
-            {**data, "vendor_id": session["user_id"]},
-        )
-        new_pid = cur.lastrowid
-
-        for idx, fn in enumerate(uploaded):
-            db.execute(
-                "INSERT INTO product_images (product_id, filename, sort_order) VALUES (?, ?, ?)",
-                (new_pid, fn, idx),
+        with get_cursor() as cur:
+            cur.execute(
+                """INSERT INTO products (name, category, brand, price, old_price,
+                                         description, image, stock, rating, vendor_id)
+                   VALUES (%(name)s, %(category)s, %(brand)s, %(price)s, %(old_price)s,
+                           %(description)s, %(image)s, %(stock)s, %(rating)s, %(vendor_id)s)
+                   RETURNING id""",
+                {**data, "vendor_id": session["user_id"]},
             )
-        if uploaded and not data.get("image"):
-            db.execute("UPDATE products SET image=? WHERE id=?", (uploaded[0], new_pid))
-        db.commit()
-
+            new_pid = cur.fetchone()["id"]
+            for idx, fn in enumerate(uploaded):
+                cur.execute(
+                    "INSERT INTO product_images (product_id, filename, sort_order) VALUES (%s, %s, %s)",
+                    (new_pid, fn, idx),
+                )
+            if uploaded and not data.get("image"):
+                cur.execute("UPDATE products SET image=%s WHERE id=%s", (uploaded[0], new_pid))
         flash(f"Product added with {len(uploaded)} image(s).", "success")
         return redirect(url_for("admin_dashboard"))
 
@@ -799,15 +832,18 @@ def admin_new_product():
 @app.route("/admin/product/<int:pid>/edit", methods=["GET", "POST"])
 @admin_required
 def admin_edit_product(pid):
-    db = get_db()
-    product = db.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM products WHERE id = %s", (pid,))
+        product = cur.fetchone()
     if not product:
         abort(404)
 
-    images = db.execute(
-        "SELECT * FROM product_images WHERE product_id = ? ORDER BY sort_order, id",
-        (pid,),
-    ).fetchall()
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT * FROM product_images WHERE product_id = %s ORDER BY sort_order, id",
+            (pid,),
+        )
+        images = cur.fetchall()
 
     if request.method == "POST":
         data = _collect_product_form(existing_image=product["image"])
@@ -816,33 +852,30 @@ def admin_edit_product(pid):
         uploaded = data.pop("_uploaded_files")
         data["id"] = pid
 
-        db.execute(
-            """UPDATE products SET
-                 name=:name, category=:category, brand=:brand,
-                 price=:price, old_price=:old_price,
-                 description=:description, image=:image,
-                 stock=:stock, rating=:rating
-               WHERE id=:id""",
-            data,
-        )
-
-        if uploaded:
-            row = db.execute(
-                "SELECT COALESCE(MAX(sort_order), -1) FROM product_images WHERE product_id=?",
-                (pid,),
-            ).fetchone()
-            next_order = row[0] + 1
-            for fn in uploaded:
-                db.execute(
-                    "INSERT INTO product_images (product_id, filename, sort_order) VALUES (?, ?, ?)",
-                    (pid, fn, next_order),
+        with get_cursor() as cur:
+            cur.execute(
+                """UPDATE products SET
+                     name=%(name)s, category=%(category)s, brand=%(brand)s,
+                     price=%(price)s, old_price=%(old_price)s,
+                     description=%(description)s, image=%(image)s,
+                     stock=%(stock)s, rating=%(rating)s
+                   WHERE id=%(id)s""",
+                data,
+            )
+            if uploaded:
+                cur.execute(
+                    "SELECT COALESCE(MAX(sort_order), -1) AS m FROM product_images WHERE product_id=%s",
+                    (pid,),
                 )
-                next_order += 1
-
-            if not product["image"]:
-                db.execute("UPDATE products SET image=? WHERE id=?", (uploaded[0], pid))
-
-        db.commit()
+                next_order = cur.fetchone()["m"] + 1
+                for fn in uploaded:
+                    cur.execute(
+                        "INSERT INTO product_images (product_id, filename, sort_order) VALUES (%s, %s, %s)",
+                        (pid, fn, next_order),
+                    )
+                    next_order += 1
+                if not product["image"]:
+                    cur.execute("UPDATE products SET image=%s WHERE id=%s", (uploaded[0], pid))
         flash(f"Product updated. {len(uploaded)} new image(s) added." if uploaded else "Product updated.", "success")
         return redirect(url_for("admin_edit_product", pid=pid))
 
@@ -852,30 +885,30 @@ def admin_edit_product(pid):
 @app.route("/admin/product/<int:pid>/image/<int:img_id>/delete", methods=["POST"])
 @admin_required
 def admin_delete_image(pid, img_id):
-    db = get_db()
-    img = db.execute(
-        "SELECT * FROM product_images WHERE id = ? AND product_id = ?",
-        (img_id, pid),
-    ).fetchone()
-    if not img:
-        abort(404)
-
-    delete_from_s3(img["filename"])
-
-    db.execute("DELETE FROM product_images WHERE id = ?", (img_id,))
-
-    product = db.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
-    if product and product["image"] == img["filename"]:
-        replacement = db.execute(
-            "SELECT filename FROM product_images WHERE product_id = ? ORDER BY sort_order, id LIMIT 1",
-            (pid,),
-        ).fetchone()
-        db.execute(
-            "UPDATE products SET image = ? WHERE id = ?",
-            (replacement["filename"] if replacement else None, pid),
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT * FROM product_images WHERE id = %s AND product_id = %s",
+            (img_id, pid),
         )
+        img = cur.fetchone()
+        if not img:
+            abort(404)
 
-    db.commit()
+        delete_from_s3(img["filename"])
+        cur.execute("DELETE FROM product_images WHERE id = %s", (img_id,))
+
+        cur.execute("SELECT * FROM products WHERE id = %s", (pid,))
+        product = cur.fetchone()
+        if product and product["image"] == img["filename"]:
+            cur.execute(
+                "SELECT filename FROM product_images WHERE product_id = %s ORDER BY sort_order, id LIMIT 1",
+                (pid,),
+            )
+            replacement = cur.fetchone()
+            cur.execute(
+                "UPDATE products SET image = %s WHERE id = %s",
+                (replacement["filename"] if replacement else None, pid),
+            )
     flash("Image deleted.", "info")
     return redirect(url_for("admin_edit_product", pid=pid))
 
@@ -883,22 +916,18 @@ def admin_delete_image(pid, img_id):
 @app.route("/admin/product/<int:pid>/delete", methods=["POST"])
 @admin_required
 def admin_delete_product(pid):
-    db = get_db()
+    with get_cursor() as cur:
+        cur.execute("SELECT filename FROM product_images WHERE product_id = %s", (pid,))
+        imgs = cur.fetchall()
+        for img in imgs:
+            delete_from_s3(img["filename"])
 
-    imgs = db.execute("SELECT filename FROM product_images WHERE product_id = ?", (pid,)).fetchall()
-    for img in imgs:
-        delete_from_s3(img["filename"])
-
-    db.execute("DELETE FROM products WHERE id = ?", (pid,))
-    db.commit()
+        cur.execute("DELETE FROM products WHERE id = %s", (pid,))
     flash("Product deleted.", "info")
     return redirect(url_for("admin_dashboard"))
 
 
 def _collect_product_form(existing_image=None):
-    """Validate & normalise the product form.
-    Returns dict (with special key '_uploaded_files' = list of saved filenames/URLs)
-    or None on error."""
     try:
         name        = request.form["name"].strip()
         category    = request.form["category"].strip()
@@ -929,14 +958,12 @@ def _collect_product_form(existing_image=None):
             safe = f"{int(datetime.now().timestamp() * 1000)}_{safe}"
 
             if USE_S3:
-                # Upload to S3 - store the FULL public URL in DB
                 url = upload_to_s3(file, safe)
                 if not url:
                     flash(f"Failed to upload '{file.filename}' to S3.", "danger")
                     return None
                 uploaded_filenames.append(url)
             else:
-                # Local-disk fallback - store bare filename
                 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
                 file.save(os.path.join(app.config["UPLOAD_FOLDER"], safe))
                 uploaded_filenames.append(safe)
@@ -968,13 +995,6 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("  ScootyBazaar is running!")
     print("  Open: http://127.0.0.1:5000")
-    print("")
-    print(f"  Vendor login:    http://127.0.0.1:5000/vendor/login")
-    print(f"     demo user: scootybazaar  /  vendor123")
-    print("")
-    print(f"  Admin portal (HIDDEN): http://127.0.0.1:5000{ADMIN_PORTAL_PATH}")
-    print(f"     Default username: {DEFAULT_ADMIN_USERNAME}")
-    print(f"     Default password: {DEFAULT_ADMIN_PASSWORD}")
     print(f"  Image storage: {'S3 (' + S3_BUCKET + ')' if USE_S3 else 'local /static/images/'}")
     print("=" * 60 + "\n")
     port = int(os.environ.get("PORT", 5000))
