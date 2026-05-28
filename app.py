@@ -42,24 +42,56 @@ app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 # ============================ DATABASE (POSTGRES) ===========================
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
-if not DATABASE_URL:
-    raise RuntimeError(
-        "DATABASE_URL env var is not set. "
-        "Get the Transaction pooler URI from Supabase and set it in Render's Environment tab."
-    )
+# Track DB status so the app can still boot (and show errors) when DB is misconfigured.
+_db_pool = None
+_db_error = None
 
-# Connection pool. On Render's free tier the service sleeps after 15 min,
-# so we want a small pool that reconnects gracefully.
-_db_pool = pg_pool.SimpleConnectionPool(
-    minconn=1,
-    maxconn=5,
-    dsn=DATABASE_URL,
-)
-print(f"[DB] Connected to Postgres via pool (max 5 connections).")
+if not DATABASE_URL:
+    _db_error = (
+        "DATABASE_URL env var is not set. Set it in Render's Environment tab "
+        "(use Supabase Transaction pooler URI on port 6543)."
+    )
+    print(f"[DB] FATAL CONFIG ERROR: {_db_error}")
+else:
+    # Mask password before logging the URL — helps debug typos without leaking secrets.
+    try:
+        from urllib.parse import urlparse as _urlparse
+        _u = _urlparse(DATABASE_URL)
+        _masked_host = _u.hostname or "?"
+        _masked_port = _u.port or "?"
+        _masked_user = _u.username or "?"
+        _masked_db   = (_u.path or "/?").lstrip("/")
+        print(f"[DB] Attempting connection: user={_masked_user} host={_masked_host} port={_masked_port} db={_masked_db}")
+    except Exception as _e:
+        print(f"[DB] Could not parse DATABASE_URL: {_e}")
+
+    try:
+        _db_pool = pg_pool.SimpleConnectionPool(
+            minconn=1,
+            maxconn=5,
+            dsn=DATABASE_URL,
+        )
+        # Test the connection right away so failures show up at boot, not first request.
+        _test_conn = _db_pool.getconn()
+        with _test_conn.cursor() as _c:
+            _c.execute("SELECT 1")
+        _db_pool.putconn(_test_conn)
+        print(f"[DB] Connected to Postgres via pool (max 5 connections).")
+    except Exception as e:
+        _db_error = f"{type(e).__name__}: {e}"
+        print(f"[DB] FATAL CONNECTION ERROR: {_db_error}")
+        print(f"[DB] Common causes:")
+        print(f"[DB]   1. Special characters in password (use only letters/numbers)")
+        print(f"[DB]   2. Wrong password — reset it in Supabase Settings → Database")
+        print(f"[DB]   3. Wrong port — must be 6543 (Transaction pooler), not 5432")
+        print(f"[DB]   4. Supabase project paused — restore it in the Supabase dashboard")
+        _db_pool = None
 
 
 def get_db():
     """Borrow a connection from the pool for the duration of one request."""
+    if _db_pool is None:
+        raise RuntimeError(f"Database is not configured: {_db_error}")
     if "db" not in g:
         g.db = _db_pool.getconn()
     return g.db
@@ -73,7 +105,7 @@ def get_cursor():
 @app.teardown_appcontext
 def close_db(error):
     db = g.pop("db", None)
-    if db is not None:
+    if db is not None and _db_pool is not None:
         # Roll back any open transaction on error, otherwise commit
         try:
             if error is None:
@@ -88,6 +120,9 @@ def close_db(error):
 def init_db():
     """Create tables & seed initial data if the DB is empty.
     Idempotent - safe to call on every startup."""
+    if _db_pool is None:
+        print("[DB] Skipping init_db (no DB connection).")
+        return
     conn = _db_pool.getconn()
     try:
         with conn.cursor() as cur:
@@ -985,6 +1020,33 @@ def _collect_product_form(existing_image=None):
 @app.errorhandler(404)
 def not_found(e):
     return render_template("404.html"), 404
+
+
+@app.errorhandler(500)
+def server_error(e):
+    """Show a clear message when the DB is unavailable, instead of a generic 500."""
+    if _db_pool is None:
+        return (
+            "<h1>Database not configured</h1>"
+            "<p>The site can't reach its database. Check Render logs for details.</p>"
+            f"<pre>{_db_error}</pre>",
+            500,
+        )
+    return "<h1>Internal server error</h1><p>Please try again shortly.</p>", 500
+
+
+# Quick health check — visit /healthz to see DB status without any auth.
+@app.route("/healthz")
+def healthz():
+    if _db_pool is None:
+        return f"DB DOWN: {_db_error}", 500
+    try:
+        with get_cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM products")
+            n = cur.fetchone()["n"]
+        return f"OK - {n} products in database", 200
+    except Exception as e:
+        return f"DB query failed: {type(e).__name__}: {e}", 500
 
 
 # ----------------------------- MAIN -----------------------------------------
