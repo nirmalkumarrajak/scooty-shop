@@ -7,21 +7,21 @@
         {% if images %}
             <div class="gallery-main">
                 <img id="mainImage"
-                     src="{{ image_url(images[0].filename) }}"
+                     src="{{ url_for('static', filename='images/' + images[0].filename) }}"
                      alt="{{ product.name }}">
             </div>
             <div class="gallery-thumbs">
                 {% for img in images %}
                     <div class="thumb-item {{ 'active' if loop.first else '' }}"
-                         onclick="swapImage(this, '{{ image_url(img.filename) }}')">
-                        <img src="{{ image_url(img.filename) }}"
+                         onclick="swapImage(this, '{{ url_for('static', filename='images/' + img.filename) }}')">
+                        <img src="{{ url_for('static', filename='images/' + img.filename) }}"
                              alt="View {{ loop.index }}">
                     </div>
                 {% endfor %}
             </div>
         {% elif product.image %}
             <div class="gallery-main">
-                <img src="{{ image_url(product.image) }}" alt="{{ product.name }}">
+                <img src="{{ url_for('static', filename='images/' + product.image) }}" alt="{{ product.name }}">
             </div>
         {% else %}
             <div class="gallery-main placeholder">
@@ -72,10 +72,6 @@
             </a>
             <a href="tel:+{{ whatsapp_number }}" class="btn-buy">📞 Call Seller</a>
         </div>
-
-        <p style="margin-top:16px; font-size:13px; color:#878787;">
-            🚚 Free delivery in 3–5 business days &nbsp;•&nbsp; 🔄 7-day replacement &nbsp;•&nbsp; 💳 COD available
-        </p>
     </div>
 </div>
 

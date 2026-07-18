@@ -36,7 +36,7 @@ DEFAULT_ADMIN_PASSWORD = "nirmal123456"
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-this-in-production-please")
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 20* 1024 * 1024
 
 
 # ============================ DATABASE (POSTGRES) ===========================
