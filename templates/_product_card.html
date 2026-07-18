@@ -1,7 +1,7 @@
 <a href="{{ url_for('product_detail', pid=p.id) }}" class="product-card">
     {% if p.image %}
         <div class="product-image">
-            <img src="{{ image_url(p.image) }}" alt="{{ p.name }}">
+            <img src="{{ p.image | img_url }}" alt="{{ p.name }}">
         </div>
     {% else %}
         <div class="product-image placeholder">

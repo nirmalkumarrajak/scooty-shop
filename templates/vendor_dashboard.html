@@ -51,7 +51,7 @@
                 <td>{{ p.id }}</td>
                 <td>
                     {% if p.image %}
-                        <div class="thumb"><img src="{{ image_url(p.image) }}"></div>
+                        <div class="thumb"><img src="{{ p.image | img_url }}"></div>
                     {% else %}
                         <div class="thumb placeholder">{{ '🛵' if p.category == 'scooter' else '🎒' }}</div>
                     {% endif %}
